@@ -29,37 +29,42 @@ The parser is therefore the most critical correctness boundary in the system. It
 
 ---
 
-### Architecture — 3-Pass System Per Page
+### Architecture — Reading-Order Extraction
 
-PDF and DOCX documents run three passes on every page. No pass is optional — all three run regardless of what the page contains.
+All parsers extract content in the exact visual reading order it appears on the page. Text, tables, and images are interleaved — not collected separately and concatenated. This preserves contextual connections like "as shown in the chart above" which would break if the chart and the sentence referencing it were separated.
 
 ```
-For each page:
-    │
-    ├── Pass 1: Text layer
-    │   PyMuPDF / python-docx extracts the readable text.
-    │   Fast. Handles the majority of content on most pages.
-    │
-    ├── Pass 2: Tables → Markdown
-    │   PyMuPDF find_tables() / python-docx table objects detect embedded tables.
-    │   Each table is converted to markdown format before storage.
-    │
-    │   Why markdown? Raw text extraction destroys table structure:
-    │   "Revenue Q1 Q2 Apple 89B 90B Google 76B 78B" — column relationships gone.
-    │   Markdown preserves them so the LLM in Phase 2 reads the data correctly.
-    │
-    └── Pass 3: Embedded Images → Claude Vision
-        PyMuPDF extracts image bytes from the page.
-        Each image is sent to Claude Vision API with a structured prompt.
-        Claude reads tables in images, describes charts numerically, handles
-        scanned content — output is merged back into the page text.
+PDF — per page:
+    Collect all text blocks      → each has a y-coordinate (vertical position)
+    Collect all tables           → each has a y-coordinate
+    Collect all embedded images  → each has a y-coordinate → sent to Claude Vision
+    Sort everything by y-coordinate
+    Output: content exactly as a human reads the page, top to bottom
 
-        Why Claude Vision instead of Tesseract (traditional OCR)?
-        Tesseract matches pixel patterns to characters. It fails on complex layouts,
-        multi-column text, and financial charts. Claude understands layout and context.
+    Text blocks overlapping with table regions are excluded to avoid
+    duplicating table content (PyMuPDF returns table cells as text blocks too).
+    Images smaller than 50×50px are skipped (decorative icons, borders).
+
+DOCX — document order:
+    Walk the body XML element by element in document order.
+    Each element is either a paragraph (<w:p>) or a table (<w:tbl>).
+    Images in DOCX are inline — they live inside paragraphs.
+    When a paragraph is encountered, its text AND any inline images
+    are extracted together, in the order they appear within the paragraph.
+
+HTML — DOM traversal order:
+    Walk the DOM tree once, top to bottom.
+    Text nodes and <img> elements collected as encountered.
+    No separate passes — an image between two paragraphs appears
+    between those paragraphs in the output.
+    <img> src resolved from: base64 data URI / relative file path / remote URL.
+
+Excel — row-position interleaving:
+    Cell values extracted as markdown table (row by row).
+    Images extracted from xlsx ZIP archive (xl/media/).
+    Each image's row anchor parsed from drawing XML inside the archive.
+    Image text inserted into the table output after the row it appears next to.
 ```
-
-All three outputs are concatenated into a single text block per page. The rest of the pipeline receives clean, structured text regardless of what the original page contained.
 
 ---
 
@@ -128,6 +133,9 @@ Table structure is converted to markdown during ingestion, not when a query arri
 **Claude Vision for images, not Tesseract**
 Traditional OCR (Tesseract) works by matching pixel patterns to known character shapes. It fails on complex financial layouts — multi-column tables, bar charts, pie charts with labels, watermarked scanned documents. Claude Vision understands layout and context, can describe numerical data in charts, and handles degraded scan quality. For enterprise financial documents, accuracy matters more than avoiding an API call.
 
+**Reading order is preserved across all formats**
+Content is never extracted in separate type-passes and then concatenated. Separating all text from all images breaks contextual connections — "as shown in the chart above" placed 300 tokens away from the chart it references gives the LLM no useful signal. Every parser outputs content in the exact order a human would read it. The implementation method differs per format (y-coordinate sorting for PDF, XML body iteration for DOCX, DOM traversal for HTML, row-anchor interleaving for Excel) but the contract is the same: output order = visual reading order.
+
 **Pass count is determined by what content the format can contain**
 PDF and DOCX run 3 passes because they can mix text, tables, and embedded images on the same page simultaneously. Excel runs 2 passes — cell values (Pass 1) and embedded images extracted from the xlsx ZIP archive (Pass 2). HTML runs 2 passes — text content (Pass 1) and `<img>` tags resolved from base64 URIs, relative paths, or remote URLs (Pass 2). CSV runs 1 pass because the format is plain text by definition — images are impossible in CSV. Standalone image files run 1 pass — the entire file is sent to Claude Vision. The pass count matches what the format is actually capable of containing, nothing more.
 
@@ -136,6 +144,17 @@ PDF and DOCX always run the same 3 passes — no conditions, no branching. Email
 
 **Single Qdrant collection with doc_id payload filter**
 All documents are stored in one Qdrant collection. Document isolation at query time is achieved via payload filtering on `doc_id`, not by creating separate collections per document. Separate collections would require separate index management and make cross-document queries impossible. One collection, filtered by payload, handles both single-document and cross-document retrieval with no architectural change.
+
+---
+
+### Known Gaps (Tracked, Not Yet Fixed)
+
+| Gap | Impact | Plan |
+|-----|--------|------|
+| Scanned PDFs — pages that are entirely images with no text layer — Pass 1 returns empty but the page is not detected and sent to Claude Vision | High | Detect empty text layer, fall back to full-page Vision |
+| Multi-column PDF layout — PyMuPDF reads columns left-to-right incorrectly, mixing content across columns | Medium | Detect multi-column layout via block x-positions, re-order |
+| Excel native chart objects — Excel charts are not images, they are chart objects invisible to our ZIP image extraction | Medium | Use openpyxl chart API to describe chart data |
+| DOCX headers and footers — content in header/footer sections is skipped | Low | Extract via `doc.sections[0].header` |
 
 ---
 

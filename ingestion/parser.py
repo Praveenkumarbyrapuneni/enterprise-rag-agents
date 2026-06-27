@@ -1,17 +1,21 @@
 """
 Parser — extracts clean text from any document format.
 
-Every parser returns List[Dict] where each dict is:
-    {"page": int, "text": str}
+All parsers return List[{"page": int, "text": str}].
 
-This uniform output means chunker, embedder, and Qdrant never need to know
-what format the original document was. Add a new format = one function + one
-line in parse_document(). Nothing else changes.
+Content is extracted in reading order — the exact order it visually appears
+on the page. Text, tables, and images are interleaved so the LLM receives
+full context. "As shown in the chart above" stays next to the chart it
+references, not separated by several paragraphs of unrelated text.
 
-PDF and DOCX run 3 passes per page/document:
-    Pass 1 — text layer
-    Pass 2 — tables → markdown (structure preserved)
-    Pass 3 — embedded images → Claude Vision (no context lost)
+How each format achieves reading order:
+  PDF    — elements (text blocks, tables, images) sorted by vertical y-position
+  DOCX   — body XML iterated in document order; inline images handled inside
+            the paragraph they belong to
+  HTML   — DOM tree walked in traversal order
+  Excel  — cell rows in sheet order; images inserted at their anchor row
+           (parsed from drawing XML inside the xlsx ZIP archive)
+  Others — inherently single-type content; reading order not applicable
 """
 
 import base64
@@ -21,14 +25,18 @@ import os
 import re
 import tempfile
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from email import policy
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import fitz  # PyMuPDF
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table as DocxTable
+from docx.text.paragraph import Paragraph as DocxParagraph
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,21 +48,16 @@ logger = logging.getLogger(__name__)
 
 def _extract_image_text(image_bytes: bytes, media_type: str = "image/png") -> str:
     """
-    Send image bytes to Claude Vision, get back extracted text.
+    Send image bytes to Claude Vision, return extracted text.
 
-    Used for:
-    - Standalone image files (.png, .jpg, etc.)
-    - Images embedded inside PDFs
-    - Images embedded inside DOCX files
-
-    Claude understands layout — tables, charts, multi-column text — where
-    traditional OCR (Tesseract) fails on complex financial documents.
+    Claude understands layout — tables in images, charts, multi-column text —
+    where traditional OCR (Tesseract) fails on complex financial documents.
     """
     import anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not set — required for image/scanned document parsing")
+        raise ValueError("ANTHROPIC_API_KEY not set — required for image parsing")
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
@@ -87,173 +90,357 @@ def _extract_image_text(image_bytes: bytes, media_type: str = "image/png") -> st
 
 
 def _rows_to_markdown(rows: List[List[str]]) -> str:
-    """
-    Convert a 2D list of cell strings into a markdown table.
-
-    Why markdown? The LLM in Phase 2 reads markdown tables correctly — it
-    understands column relationships. Raw CSV-style text loses that structure.
-    """
+    """Convert a 2D list of cell strings into a markdown table."""
     if not rows:
         return ""
     header = "| " + " | ".join(str(c) for c in rows[0]) + " |"
     sep = "| " + " | ".join(["---"] * len(rows[0])) + " |"
-    body_rows = ["| " + " | ".join(str(c) for c in row) + " |" for row in rows[1:]]
-    return "\n".join([header, sep] + body_rows)
+    body = ["| " + " | ".join(str(c) for c in row) + " |" for row in rows[1:]]
+    return "\n".join([header, sep] + body)
 
 
-# ── Format parsers ────────────────────────────────────────────────────────────
+def _bbox_overlaps(b1: Tuple, b2: Tuple) -> bool:
+    """True if two bounding boxes (x0,y0,x1,y1) overlap."""
+    return not (b1[2] <= b2[0] or b1[0] >= b2[2] or b1[3] <= b2[1] or b1[1] >= b2[3])
+
+
+def _media_type(ext: str) -> str:
+    return "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+
+
+# ── PDF ───────────────────────────────────────────────────────────────────────
 
 
 def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
     """
-    PDF — 3 passes per page:
-        Pass 1: text layer  (PyMuPDF get_text)
-        Pass 2: tables      (PyMuPDF find_tables → markdown)
-        Pass 3: images      (PyMuPDF extract_image → Claude Vision)
+    PDF — reading-order extraction per page.
 
-    Each page = one dict so citations point to exact page numbers.
+    Collects text blocks, tables, and images each with their bounding box
+    y-coordinate, then sorts everything by vertical position before merging.
+    Text blocks that overlap with detected table regions are excluded to avoid
+    duplicating table content (PyMuPDF returns table cells as text blocks too).
+
+    Result: content exactly as a human would read the page top to bottom.
     """
     doc = fitz.open(file_path)
     pages = []
 
     for page_num, page in enumerate(doc, start=1):
-        parts: List[str] = []
+        elements: List[Dict] = []
 
-        # Pass 1 — text layer
-        text = page.get_text().strip()
-        if text:
-            parts.append(text)
+        # Detect tables first so we can exclude overlapping text blocks
+        tables = list(page.find_tables())
+        table_bboxes = [t.bbox for t in tables]
 
-        # Pass 2 — tables
-        for table in page.find_tables():
+        # Text blocks — skip blocks whose area overlaps a table region
+        for block in page.get_text("blocks"):
+            x0, y0, x1, y1, text, _, block_type = block
+            if block_type != 0 or not text.strip():
+                continue
+            block_bbox = (x0, y0, x1, y1)
+            if any(_bbox_overlaps(block_bbox, tb) for tb in table_bboxes):
+                continue
+            elements.append({"y": y0, "content": text.strip()})
+
+        # Tables — use their top y-coordinate for ordering
+        for table in tables:
             rows = [[str(cell or "").strip() for cell in row] for row in table.extract()]
             md = _rows_to_markdown(rows)
             if md:
-                parts.append(f"\n[Table]\n{md}")
+                elements.append({"y": table.bbox[1], "content": f"[Table]\n{md}"})
 
-        # Pass 3 — embedded images
-        for img in page.get_images(full=True):
-            xref = img[0]
+        # Images — filter out small decorative images (icons, borders < 50px)
+        for img_info in page.get_image_info():
+            if img_info.get("width", 0) < 50 or img_info.get("height", 0) < 50:
+                continue
+            xref = img_info["xref"]
+            y0 = img_info["bbox"][1]
             try:
-                img_info = doc.extract_image(xref)
-                ext = img_info["ext"]
-                media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-                img_text = _extract_image_text(img_info["image"], media_type)
+                img_data = doc.extract_image(xref)
+                img_text = _extract_image_text(
+                    img_data["image"], _media_type(img_data["ext"])
+                )
                 if img_text.strip():
-                    parts.append(f"\n[Image]\n{img_text}")
+                    elements.append({"y": y0, "content": f"[Image]\n{img_text}"})
             except Exception as e:
                 logger.warning(f"PDF page {page_num} image extraction failed: {e}")
 
-        if parts:
-            pages.append({"page": page_num, "text": "\n".join(parts)})
+        # Sort by vertical position → reading order
+        elements.sort(key=lambda e: e["y"])
+
+        if elements:
+            pages.append({
+                "page": page_num,
+                "text": "\n\n".join(e["content"] for e in elements),
+            })
 
     doc.close()
     return pages
 
 
+# ── DOCX ──────────────────────────────────────────────────────────────────────
+
+
 def parse_docx(file_path: str) -> List[Dict[str, Any]]:
     """
-    DOCX — text + tables + embedded images.
+    DOCX — reading-order extraction via XML body iteration.
 
-    DOCX has no real page numbers (Word calculates pages at render time based
-    on font/margins). Everything returns as page 1. This is the right tradeoff —
-    forcing fake page numbers would be less accurate than admitting we don't have them.
+    The DOCX body is a sequence of paragraph (<w:p>) and table (<w:tbl>)
+    elements in document order. Images in DOCX are inline — they live inside
+    paragraphs as <w:drawing> elements. By walking the body XML in order and
+    handling images when we encounter the paragraph that contains them, we
+    preserve the exact document flow.
+
+    DOCX has no stored page numbers (Word calculates them at render time from
+    font/margin settings). Everything returns as page 1.
     """
     doc = Document(file_path)
     parts: List[str] = []
 
-    # Pass 1 — paragraphs
-    for para in doc.paragraphs:
-        if para.text.strip():
-            parts.append(para.text.strip())
+    for element in doc.element.body:
+        tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
 
-    # Pass 2 — tables
-    for table in doc.tables:
-        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
-        md = _rows_to_markdown(rows)
-        if md:
-            parts.append(f"\n[Table]\n{md}")
+        if tag == "p":
+            para = DocxParagraph(element, doc)
+            if para.text.strip():
+                parts.append(para.text.strip())
 
-    # Pass 3 — embedded images (stored as relationships in the DOCX zip)
-    for rel in doc.part.rels.values():
-        if "image" in rel.reltype:
-            try:
-                img_bytes = rel.target_part.blob
-                ext = rel.target_ref.split(".")[-1].lower()
-                media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-                img_text = _extract_image_text(img_bytes, media_type)
-                if img_text.strip():
-                    parts.append(f"\n[Image]\n{img_text}")
-            except Exception as e:
-                logger.warning(f"DOCX image extraction failed: {e}")
+            # Inline images live inside paragraphs — handle them here, in order
+            for drawing in element.findall(".//" + qn("w:drawing")):
+                for blip in drawing.findall(".//" + qn("a:blip")):
+                    r_id = blip.get(qn("r:embed"))
+                    if r_id and r_id in doc.part.rels:
+                        rel = doc.part.rels[r_id]
+                        if "image" in rel.reltype:
+                            try:
+                                ext = rel.target_ref.split(".")[-1].lower()
+                                img_text = _extract_image_text(
+                                    rel.target_part.blob, _media_type(ext)
+                                )
+                                if img_text.strip():
+                                    parts.append(f"[Image]\n{img_text}")
+                            except Exception as e:
+                                logger.warning(f"DOCX image extraction failed: {e}")
 
-    return [{"page": 1, "text": "\n".join(parts)}] if parts else []
+        elif tag == "tbl":
+            table = DocxTable(element, doc)
+            rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+            md = _rows_to_markdown(rows)
+            if md:
+                parts.append(f"[Table]\n{md}")
+
+    return [{"page": 1, "text": "\n\n".join(parts)}] if parts else []
+
+
+# ── Excel ─────────────────────────────────────────────────────────────────────
+
+
+def _excel_image_row_positions(file_path: str) -> List[Tuple[int, bytes, str]]:
+    """
+    Parse xlsx drawing XML to find each image's row anchor position.
+
+    Returns list of (row_index, image_bytes, media_type).
+    row_index is 0-based — the spreadsheet row the image is anchored to.
+
+    xlsx is a ZIP. Image positions are in xl/drawings/drawing*.xml.
+    Image files are in xl/media/. Drawing rels map rId → image file.
+    """
+    results: List[Tuple[int, bytes, str]] = []
+    ns = {
+        "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        "a":   "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    r_embed = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+
+    with zipfile.ZipFile(file_path, "r") as z:
+        all_files = set(z.namelist())
+
+        for i in range(1, 20):
+            drawing_path = f"xl/drawings/drawing{i}.xml"
+            rels_path = f"xl/drawings/_rels/drawing{i}.xml.rels"
+            if drawing_path not in all_files:
+                break
+
+            # Map rId → image file path inside the archive
+            r_id_to_file: Dict[str, str] = {}
+            if rels_path in all_files:
+                rels_root = ET.fromstring(z.read(rels_path))
+                for rel in rels_root:
+                    r_id = rel.get("Id", "")
+                    target = rel.get("Target", "")
+                    if "../media/" in target:
+                        img_file = "xl/media/" + target.split("../media/")[-1]
+                        r_id_to_file[r_id] = img_file
+
+            # Parse drawing XML for anchor positions
+            draw_root = ET.fromstring(z.read(drawing_path))
+            anchor_tags = (
+                draw_root.findall(".//xdr:twoCellAnchor", ns) +
+                draw_root.findall(".//xdr:oneCellAnchor", ns)
+            )
+
+            for anchor in anchor_tags:
+                row = 0
+                from_elem = anchor.find("xdr:from", ns)
+                if from_elem is not None:
+                    row_elem = from_elem.find("xdr:row", ns)
+                    if row_elem is not None and row_elem.text:
+                        row = int(row_elem.text)
+
+                for blip in anchor.findall(".//a:blip", ns):
+                    r_id = blip.get(r_embed, "")
+                    img_file = r_id_to_file.get(r_id, "")
+                    if img_file and img_file in all_files:
+                        img_bytes = z.read(img_file)
+                        ext = os.path.splitext(img_file)[1].lower().lstrip(".")
+                        results.append((row, img_bytes, _media_type(ext)))
+
+    return results
 
 
 def parse_excel(file_path: str) -> List[Dict[str, Any]]:
     """
-    Excel — 2 passes:
-        Pass 1: cell values per sheet → markdown table (pandas)
-        Pass 2: embedded images → Claude Vision (.xlsx only — xlsx is a ZIP archive,
-                images live in xl/media/. .xls is a legacy binary format with no
-                accessible image layer via this approach.)
+    Excel — cell values as markdown table with images inserted at their
+    anchor row position.
 
-    Each sheet = one page. Images appended to the last sheet's page.
-    ponytail: exact sheet-level image attribution requires drawing XML parsing —
-    appending to last sheet is correct enough for financial docs where images
-    are typically on summary/cover sheets.
+    Each sheet = one page. Images are extracted from the xlsx ZIP archive,
+    their row anchor parsed from drawing XML, and inserted into the table
+    output immediately after the row they visually appear next to.
+    .xls (legacy binary format) — cell values only, no image extraction.
     """
     xl = pd.ExcelFile(file_path)
     pages = []
 
-    # Pass 1 — cell values
+    # Get image positions once (applies across sheets for now)
+    # ponytail: cross-sheet image attribution requires sheet→drawing mapping
+    # via xl/workbook.xml.rels — current approach loads all images from all
+    # drawings and anchors them by row only, not by sheet.
+    image_positions: List[Tuple[int, bytes, str]] = []
+    if file_path.lower().endswith(".xlsx"):
+        try:
+            image_positions = _excel_image_row_positions(file_path)
+            image_positions.sort(key=lambda x: x[0])
+        except Exception as e:
+            logger.warning(f"Excel image position parsing failed: {e}")
+
     for sheet_num, sheet_name in enumerate(xl.sheet_names, start=1):
         df = xl.parse(sheet_name)
-        if df.empty:
-            continue
-        pages.append({"page": sheet_num, "text": f"Sheet: {sheet_name}\n\n{df.to_markdown(index=False)}"})
+        parts: List[str] = [f"Sheet: {sheet_name}"]
 
-    # Pass 2 — embedded images (xlsx = ZIP, images stored in xl/media/)
-    if file_path.lower().endswith(".xlsx"):
-        image_texts: List[str] = []
-        with zipfile.ZipFile(file_path, "r") as z:
-            media_files = [f for f in z.namelist() if f.startswith("xl/media/")]
-            for media_file in media_files:
-                try:
-                    img_bytes = z.read(media_file)
-                    ext = os.path.splitext(media_file)[1].lower().lstrip(".")
-                    media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-                    img_text = _extract_image_text(img_bytes, media_type)
-                    if img_text.strip():
-                        image_texts.append(f"[Image]\n{img_text}")
-                except Exception as e:
-                    logger.warning(f"Excel image extraction failed for {media_file}: {e}")
+        if not df.empty:
+            # Build rows list for interleaving
+            md_lines = df.to_markdown(index=False).split("\n")
+            # md_lines[0] = header row, [1] = separator, [2+] = data rows
+            result_lines = md_lines[:2]
 
-        if image_texts:
-            if pages:
-                pages[-1]["text"] += "\n\n" + "\n\n".join(image_texts)
-            else:
-                pages.append({"page": 1, "text": "\n\n".join(image_texts)})
+            for data_row_idx, line in enumerate(md_lines[2:]):
+                result_lines.append(line)
+                # Insert images anchored at this row (0-based row index)
+                for row_anchor, img_bytes, media_type in image_positions:
+                    if row_anchor == data_row_idx:
+                        try:
+                            img_text = _extract_image_text(img_bytes, media_type)
+                            if img_text.strip():
+                                result_lines.append(f"\n[Image at row {data_row_idx + 1}]\n{img_text}")
+                        except Exception as e:
+                            logger.warning(f"Excel image extraction failed: {e}")
+
+            parts.append("\n".join(result_lines))
+
+            # Append any images beyond the last data row
+            last_row = len(md_lines) - 3
+            for row_anchor, img_bytes, media_type in image_positions:
+                if row_anchor > last_row:
+                    try:
+                        img_text = _extract_image_text(img_bytes, media_type)
+                        if img_text.strip():
+                            parts.append(f"[Image]\n{img_text}")
+                    except Exception as e:
+                        logger.warning(f"Excel image extraction failed: {e}")
+
+        if len(parts) > 1:
+            pages.append({"page": sheet_num, "text": "\n\n".join(parts)})
 
     return pages
 
 
+# ── CSV ───────────────────────────────────────────────────────────────────────
+
+
 def parse_csv(file_path: str) -> List[Dict[str, Any]]:
-    """CSV — entire file as one markdown table."""
+    """CSV — rows as markdown table. Images are impossible in this format."""
     df = pd.read_csv(file_path)
     return [{"page": 1, "text": df.to_markdown(index=False)}]
 
 
+# ── HTML ──────────────────────────────────────────────────────────────────────
+
+
+def _resolve_html_image(src: str, base_dir: str) -> str:
+    """Resolve any img src type (base64, relative path, remote URL) → text."""
+    media_type_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+    }
+    try:
+        if src.startswith("data:image/"):
+            match = re.match(r"data:(image/\w+);base64,(.+)", src, re.DOTALL)
+            if match:
+                return _extract_image_text(base64.b64decode(match.group(2)), match.group(1))
+
+        elif src.startswith(("http://", "https://")):
+            with urllib.request.urlopen(src, timeout=10) as resp:
+                img_bytes = resp.read()
+            ext = src.split(".")[-1].lower().split("?")[0]
+            return _extract_image_text(img_bytes, media_type_map.get(ext, "image/png"))
+
+        else:
+            img_path = os.path.join(base_dir, src)
+            if os.path.exists(img_path):
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
+                ext = os.path.splitext(src)[1].lower().lstrip(".")
+                return _extract_image_text(img_bytes, media_type_map.get(ext, "image/png"))
+    except Exception as e:
+        logger.warning(f"HTML image resolution failed for '{src}': {e}")
+    return ""
+
+
+def _walk_html(node: Any, base_dir: str, parts: List[str]) -> None:
+    """
+    Recursively walk the HTML DOM in document order.
+
+    Text nodes and <img> elements are collected as they appear — no separate
+    passes. An image between two paragraphs appears between those paragraphs
+    in the output, preserving the visual reading flow.
+    """
+    if isinstance(node, NavigableString):
+        text = str(node).strip()
+        if text:
+            parts.append(text)
+    elif isinstance(node, Tag):
+        if node.name == "img":
+            src = node.get("src", "").strip()
+            if src:
+                img_text = _resolve_html_image(src, base_dir)
+                if img_text.strip():
+                    parts.append(f"[Image]\n{img_text}")
+        else:
+            for child in node.children:
+                _walk_html(child, base_dir, parts)
+            # Add paragraph break after block-level elements
+            if node.name in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+                             "li", "tr", "br", "section", "article"):
+                parts.append("")
+
+
 def parse_html(file_path: str) -> List[Dict[str, Any]]:
     """
-    HTML — 2 passes:
-        Pass 1: strip tags, keep readable text (BeautifulSoup)
-        Pass 2: <img> tags → Claude Vision
+    HTML — DOM-order traversal.
 
-    Three src types handled:
-      - data:image/... base64 URI → decode directly
-      - relative path            → read from disk relative to the HTML file
-      - http/https URL           → download (requires internet, skipped on failure)
+    Walks the HTML tree once, collecting text and images in the exact order
+    they appear in the document. No separate passes.
     """
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "html.parser")
@@ -261,84 +448,39 @@ def parse_html(file_path: str) -> List[Dict[str, Any]]:
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
 
-    parts: List[str] = []
-
-    # Pass 1 — text
-    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
-    if lines:
-        parts.append("\n".join(lines))
-
-    # Pass 2 — images
     base_dir = os.path.dirname(os.path.abspath(file_path))
-    media_type_map = {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg",
-        "png": "image/png", "gif": "image/gif", "webp": "image/webp",
-    }
+    parts: List[str] = []
+    _walk_html(soup, base_dir, parts)
 
-    for img_tag in soup.find_all("img"):
-        src = img_tag.get("src", "").strip()
-        if not src:
-            continue
-        try:
-            if src.startswith("data:image/"):
-                # base64 data URI — no disk/network access needed
-                match = re.match(r"data:(image/\w+);base64,(.+)", src, re.DOTALL)
-                if match:
-                    img_text = _extract_image_text(
-                        base64.b64decode(match.group(2)), match.group(1)
-                    )
-                    if img_text.strip():
-                        parts.append(f"\n[Image]\n{img_text}")
+    text = "\n".join(line for line in "\n".join(parts).splitlines() if line.strip())
+    return [{"page": 1, "text": text}] if text else []
 
-            elif src.startswith(("http://", "https://")):
-                # remote URL — download with timeout
-                with urllib.request.urlopen(src, timeout=10) as resp:
-                    img_bytes = resp.read()
-                ext = src.split(".")[-1].lower().split("?")[0]
-                media_type = media_type_map.get(ext, "image/png")
-                img_text = _extract_image_text(img_bytes, media_type)
-                if img_text.strip():
-                    parts.append(f"\n[Image]\n{img_text}")
 
-            else:
-                # relative file path
-                img_path = os.path.join(base_dir, src)
-                if os.path.exists(img_path):
-                    with open(img_path, "rb") as f:
-                        img_bytes = f.read()
-                    ext = os.path.splitext(src)[1].lower().lstrip(".")
-                    media_type = media_type_map.get(ext, "image/png")
-                    img_text = _extract_image_text(img_bytes, media_type)
-                    if img_text.strip():
-                        parts.append(f"\n[Image]\n{img_text}")
-
-        except Exception as e:
-            logger.warning(f"HTML image extraction failed for '{src}': {e}")
-
-    return [{"page": 1, "text": "\n".join(parts)}] if parts else []
+# ── Standalone image ──────────────────────────────────────────────────────────
 
 
 def parse_image(file_path: str) -> List[Dict[str, Any]]:
-    """Standalone image file — send directly to Claude Vision."""
-    ext = os.path.splitext(file_path)[1].lower()
+    """Standalone image file — sent directly to Claude Vision."""
     media_type_map = {
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
         ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
     }
-    media_type = media_type_map.get(ext, "image/png")
+    ext = os.path.splitext(file_path)[1].lower()
     with open(file_path, "rb") as f:
         image_bytes = f.read()
-    text = _extract_image_text(image_bytes, media_type)
+    text = _extract_image_text(image_bytes, media_type_map.get(ext, "image/png"))
     return [{"page": 1, "text": text}]
+
+
+# ── Email ─────────────────────────────────────────────────────────────────────
 
 
 def parse_email(file_path: str) -> List[Dict[str, Any]]:
     """
-    .eml file — extracts subject + body + attachments.
+    .eml file — body text + attachments parsed recursively.
 
-    Attachments are routed back through parse_document() recursively.
-    So a .eml with a PDF attachment gives you email body on page 1,
-    then every page of the PDF after that. Everything in one pipeline.
+    Attachments are routed through parse_document() so any attachment type
+    is handled automatically without additional logic here.
     """
     with open(file_path, "rb") as f:
         msg = email_lib.message_from_binary_file(f, policy=policy.default)
@@ -383,15 +525,13 @@ def parse_email(file_path: str) -> List[Dict[str, Any]]:
     return [{"page": 1, "text": body}] + attachment_pages
 
 
-# ── Router — single entry point ───────────────────────────────────────────────
+# ── Router ────────────────────────────────────────────────────────────────────
 
 
 def parse_document(file_path: str) -> List[Dict[str, Any]]:
     """
-    Detect format by extension and route to the right parser.
-
-    This is the only function the rest of the system calls.
-    Adding a new format = write one function + add one line in `parsers` dict.
+    Single entry point. Detects format by extension, routes to specialist.
+    Adding a new format = write one function + add one line here.
     """
     ext = os.path.splitext(file_path)[1].lower()
     parsers = {
