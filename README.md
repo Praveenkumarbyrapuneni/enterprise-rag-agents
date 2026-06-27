@@ -1,97 +1,96 @@
 # Enterprise RAG + Multi-Agent System
 
-A production-grade financial document intelligence platform. Users upload earnings reports, SEC filings, and company documents. The system answers complex questions with cited sources, cross-references multiple documents simultaneously, and scores its own retrieval quality using RAGAS.
+A production-grade financial document intelligence platform. Ingests earnings reports, SEC filings, analyst reports, and internal documents — then answers complex questions with cited sources, cross-references multiple documents simultaneously, and scores its own retrieval quality using RAGAS.
 
 ---
 
-## Ingestion Pipeline — Document Parser
+## Document Parser — Production-Grade Ingestion
 
-### Why the Parser is the Foundation
+Most RAG systems fail in production before a single agent runs. The failure point is the parser. A naive parser silently drops content — a scanned page returns empty, a table becomes an unreadable string, an embedded chart disappears entirely. The LLM downstream never knows what it missed.
 
-Every component downstream — chunker, embedder, vector store, agents — receives its input from the parser. If the parser loses context at this stage, that information is gone permanently. No retrieval logic can recover data that was never extracted.
+This parser was built against every failure mode that surfaces in real enterprise financial environments. Every edge case below was identified, reasoned about, and explicitly handled.
 
-The parser is therefore the most critical correctness boundary in the system. It was built first and built to handle every document format an enterprise financial environment produces.
+---
+
+### Failure Modes This Parser Does Not Have
+
+**Silent content loss on scanned pages**
+A fully scanned PDF page has no text layer. A naive parser calls `get_text()`, gets nothing, moves on. The page is gone. This parser detects zero-content pages after all extraction passes and renders the full page as a 150 DPI bitmap, then sends it to Claude Vision. Scanned annual reports, faxed documents, and legacy filings are fully recovered.
+
+**Wrong reading order on multi-column layouts**
+A naive parser sorts text blocks top-to-bottom across the full page width. On a two-column analyst report, this interleaves content from both columns — the LLM reads gibberish. This parser detects two-column layout by checking whether text blocks cluster in two groups across the page midpoint. Left column is output top-to-bottom, then right column — the order a human would read it.
+
+**Context broken by separating images from their captions**
+A naive parser extracts all text first, all images last. "As shown in the chart above, revenue grew 23% YoY" is now 400 tokens away from the chart it references. This parser extracts content in exact visual reading order per page — text, image, text, table — sorted by y-coordinate. The chart and its caption are adjacent in the output.
+
+**Duplicate image extraction wasting tokens and polluting retrieval**
+A document header logo repeated across 40 pages. A naive parser sends the same image to Claude Vision 40 times, outputs the same text 40 times, stores 40 identical chunks in the vector database. This parser tracks image xrefs per page and processes each unique image exactly once.
+
+**DOCX text boxes silently skipped**
+Financial Word documents frequently use floating callout boxes and sidebar panels to highlight key statistics, warnings, and risk factors. These are `w:txbxContent` elements inside drawing objects — not paragraphs, not tables. A naive python-docx parser iterating paragraphs never sees them. This parser explicitly searches drawing elements for text box content and extracts it in document order.
+
+**DOCX embedded charts invisible**
+Word documents regularly embed Excel charts — revenue charts, margin trends, segment breakdowns. These are `c:chart` references inside drawing elements, not images. A naive parser scanning for `a:blip` (image references) misses them entirely. This parser resolves `c:chart` references through the document relationship map, parses the chart XML for cached series data, and outputs it as a structured markdown table.
+
+**Excel native chart objects invisible**
+Excel's built-in charts (bar charts, pie charts, line charts) are not image files. They live in `xl/charts/chart*.xml` inside the xlsx archive. A parser extracting from `xl/media/` misses every single one. This parser parses the drawing XML for both `a:blip` (images) and `c:chart` (native chart objects), extracts each chart's title, series names, category labels, and cached numeric values, and inserts them at the row they're anchored to in the sheet.
+
+**Excel merged cell headers outputting NaN**
+Financial spreadsheets almost always have merged header rows — a label spanning four columns. pandas reads merged cells as NaN except the top-left cell. The markdown table output then has `| Revenue | NaN | NaN | NaN |`. This parser forward-fills merged regions horizontally and vertically before converting to markdown, so the header appears correctly across all columns.
+
+**HTML tables destroyed by text extraction**
+Walking an HTML page with `get_text()` turns a structured revenue table into `"Revenue Q1 Q2 Q3 Apple 89B 90B Google 76B 78B"` — all column relationships gone. This parser detects `<table>` elements during DOM traversal and converts them to markdown before continuing the walk. Structure is preserved everywhere the LLM needs it.
+
+**Corporate email inline images missed**
+HTML corporate emails embed images inline using the `cid:` scheme — `<img src="cid:chart1@report">`. The MIME part containing the image has a matching `Content-ID` header. A parser calling `soup.get_text()` on the HTML body strips all images. This parser first collects all MIME parts by Content-ID, then walks the HTML body with a custom DOM traverser that matches `cid:` references to the collected images and sends each to Claude Vision.
+
+**TIFF files unreadable**
+Document scanners output TIFF. Financial document management systems archive as TIFF. Claude Vision does not accept TIFF natively. A parser without TIFF support returns an unsupported format error. This parser converts each TIFF frame to PNG in memory via Pillow and sends it to Vision. Multi-page TIFF files — entire document batches scanned into one file — are split into one output page per frame.
+
+**CSV encoding and delimiter crashes**
+Non-UTF-8 CSVs from legacy financial systems crash with `UnicodeDecodeError`. Tab-separated or semicolon-separated exports are misread as single-column data. This parser auto-detects delimiter using pandas' sniffing engine and falls back from UTF-8 to Latin-1 on decode errors.
+
+**Password-protected files crashing with cryptic errors**
+A raw `fitz` exception on a password-protected PDF gives the caller a C library error with no actionable information. This parser checks `doc.is_encrypted` immediately after open and raises a clear `ValueError` naming the file. Excel files are caught the same way.
+
+**DOCX headers and footers silently skipped**
+Financial documents put critical metadata in headers and footers — document title, classification level, date, legal notices, confidentiality disclaimers. A naive python-docx parser iterating body paragraphs never touches them. This parser extracts headers from all document sections before body content and footers after, with deduplication for consistent headers across sections.
+
+---
+
+### Known Limitation
+
+**PDF vector graphics**
+Charts drawn as PDF path instructions — `moveto`, `lineto`, `fill` — are invisible to both text extraction and image extraction. They are not text characters and they are not embedded image files. They are mathematical drawing commands that a PDF viewer renders on screen.
+
+This affects PDFs exported from Excel, PowerPoint, or design tools where charts become vector objects rather than raster images. The scanned page fallback does not apply because these pages have readable text alongside the vector graphics — only the chart is missing, not the whole page.
+
+The correct fix is detecting pages with significant vector drawing content and selectively rendering those regions as bitmaps. This is not yet implemented. It is the one category of content this parser cannot recover.
 
 ---
 
 ### Supported Formats
 
-| Format | Tool | Notes |
-|--------|------|-------|
-| PDF | PyMuPDF | Text + tables + images sorted by y-position per page |
-| DOCX | python-docx | Text + tables + images/textboxes/charts in XML order; headers/footers |
-| Excel (.xlsx) | pandas + zipfile | Cells (merged filled) + images + native charts at anchor rows |
-| Excel (.xls) | pandas | Cell values only — legacy binary format |
-| CSV | pandas | Auto-detects delimiter and encoding; markdown table output |
-| HTML | BeautifulSoup | DOM walk: text + tables (markdown) + images in document order |
-| Images (.png, .jpg, .gif, .webp) | Claude Vision | Entire file sent to Vision |
-| TIFF (.tif, .tiff) | Pillow + Claude Vision | Each frame → PNG → Vision; multi-frame support |
-| Email (.eml) | Python stdlib `email` | Body + cid: inline images + attachments (recursive) |
+| Format | Extraction |
+|--------|-----------|
+| PDF | Text + tables + images sorted by vertical position. Scanned pages rendered to bitmap. Two-column layout detected and reordered. Duplicate images deduplicated. |
+| DOCX | Body XML in document order. Inline images, floating text boxes, and embedded charts extracted at their paragraph. All section headers and footers included. |
+| Excel (.xlsx) | Cell values with merged regions filled. Native chart objects parsed from XML. Images and charts inserted at anchor row positions. |
+| Excel (.xls) | Cell values only — legacy binary format has no accessible drawing layer. |
+| CSV | Delimiter and encoding auto-detected. Outputs as markdown table. |
+| HTML | Single DOM walk. Text, tables (markdown), and images collected in document order. Images resolved from base64 URIs, relative paths, or remote URLs. |
+| Images (.png .jpg .gif .webp) | Sent directly to Claude Vision. |
+| TIFF (.tif .tiff) | Each frame converted to PNG via Pillow. Multi-frame files produce one page per frame. |
+| Email (.eml) | Body text extracted. cid: inline images resolved from MIME parts. All attachments parsed recursively through the format router. |
 
 ---
 
-### Architecture — Reading-Order Extraction
+### Architecture
 
-All parsers extract content in the exact visual reading order it appears on the page. Text, tables, and images are interleaved — not collected separately and concatenated. This preserves contextual connections like "as shown in the chart above" which would break if the chart and the sentence referencing it were separated.
+**Single entry point**
 
 ```
-PDF — per page:
-    Collect text blocks, tables, and images each with x and y coordinates.
-    Multi-column detection: if ≥25% of text blocks fall in each half of the
-    page width, treat as two-column layout — left column output first
-    (sorted by y), full-width elements next, then right column (sorted by y).
-    Single-column: all elements sorted by y.
-    Text blocks overlapping table regions excluded (avoid duplication).
-    Images < 50×50px skipped (decorative icons, borders).
-    Scanned page fallback: if zero content extracted after all passes,
-    the page is rendered as a full bitmap at 150 DPI and sent to Claude Vision.
-    This recovers scanned PDFs that have no text layer at all.
-
-DOCX — document order:
-    Headers extracted from doc.sections[0].header — prepended before body.
-    Body XML iterated element by element in document order.
-    Each element is a paragraph (<w:p>) or a table (<w:tbl>).
-    Images in DOCX are inline inside paragraphs — extracted at the paragraph
-    they belong to, preserving their position relative to surrounding text.
-    Footers extracted from doc.sections[0].footer — appended after body.
-
-HTML — DOM traversal:
-    Walk the DOM tree once. Text, <img> elements, and <table> elements collected
-    as encountered. Tables converted to markdown (not raw text) to preserve
-    column relationships. <img> src resolved from base64 data URI, relative
-    file path, or remote URL.
-
-Excel — drawing XML parsing:
-    Merged cells forward-filled before markdown conversion (prevents NaN output
-    from merged header rows common in financial spreadsheets).
-    Drawings XML parsed for both images (a:blip) and native chart objects (c:chart).
-    Chart XML parsed for cached title, series names, categories, and values.
-    All embedded content inserted at their anchor row in the table output.
-
-Email — cid: inline image resolution:
-    Before processing the body, all MIME parts with Content-ID headers collected
-    into a map. HTML body walked with DOM traversal — when <img src="cid:...">
-    is encountered, the Content-ID is matched to the map and bytes sent to Vision.
-    Attachments parsed recursively through the router.
-
-TIFF — multi-frame support:
-    Claude Vision does not accept TIFF natively. Each frame converted to PNG
-    via Pillow. Multi-page TIFF files (common for scanned document batches)
-    produce one output page per frame.
-
-Known limitation:
-    PDF vector graphics — charts drawn as mathematical path instructions are
-    invisible to both text extraction and image extraction. Selective rendering
-    of vector-only page regions is the correct fix but not yet implemented.
-```
-
----
-
-### The Router Pattern — Single Entry Point
-
-```python
-parse_document(file_path)   # only function the rest of the system calls
-    │
+parse_document(file_path)
     ├── .pdf         → parse_pdf()
     ├── .docx        → parse_docx()
     ├── .xlsx/.xls   → parse_excel()
@@ -102,70 +101,61 @@ parse_document(file_path)   # only function the rest of the system calls
     └── .eml         → parse_email()
 ```
 
-Nothing in the pipeline calls `parse_pdf()` or `parse_excel()` directly. Everything goes through `parse_document()`.
+Nothing downstream calls a format-specific function directly. Adding a new format requires writing one function and one line in the router — no other file changes.
 
-**Why this matters for extensibility:** Adding a new format requires writing one function and adding one line to the router dictionary. No other file in the system changes. The chunker, embedder, and Qdrant uploader are completely unaware that a new format was added.
+**Uniform output**
+
+Every parser returns `List[{"page": int, "text": str}]` regardless of input format. The chunker, embedder, and vector store are completely format-agnostic.
+
+**Recursive email handling**
+
+Email attachments are unknown format at parse time. Rather than branching on attachment type inside the email parser, each attachment is saved to a temp file and routed through `parse_document()`. The router resolves the type. An email containing a PDF, an Excel file, and a TIFF scan is fully parsed without a single format-specific line inside `parse_email()`.
+
+**Reading order per format**
+
+| Format | How reading order is achieved |
+|--------|------------------------------|
+| PDF | Text blocks, tables, images collected with x/y coordinates, sorted by y. Two-column detection reorders by column then y. |
+| DOCX | Body XML iterated in document order. Images handled inside their parent paragraph, not in a separate pass. |
+| HTML | Single DOM traversal. Tables and images processed where they appear, not after all text. |
+| Excel | Drawing XML parsed for row anchor positions. Images and charts inserted at the row they visually belong to. |
+| Email | cid: images resolved inline during HTML body traversal, not appended after text. |
 
 ---
 
-### Uniform Output Contract
+## System Architecture
 
-Every parser — regardless of input format — returns the same structure:
-
-```python
-List[{"page": int, "text": str}]
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     FastAPI REST API                            │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   LANGGRAPH ORCHESTRATOR                        │
+└──────┬──────────────┬──────────────┬──────────────┬────────────┘
+       │              │              │              │
+       ▼              ▼              ▼              ▼
+┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────────┐
+│  Agent 1 │  │   Agent 2    │  │  Agent 3 │  │   Agent 4    │
+│  Query   │  │  Retriever   │  │Synthesizer│  │  Evaluator  │
+│ Analyzer │  │  + Reranker  │  │ Citations│  │   (RAGAS)   │
+└──────────┘  └──────┬───────┘  └──────────┘  └──────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      QDRANT VECTOR STORE                        │
+│           Single collection — doc_id payload filtering          │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-A PDF with 50 pages returns 50 dicts. An Excel file with 3 sheets returns 3 dicts. An image file returns 1 dict. The chunker receives the same structure in all cases and applies the same logic.
+**Agent 1 — Query Analyzer:** Decomposes complex questions into sub-queries. Identifies relevant documents. Detects cross-document vs single-document queries. Implements HyDE (Hypothetical Document Embeddings) for better retrieval.
 
-This contract is what makes the pipeline composable. Each component has one job and one expected input format.
+**Agent 2 — Retriever:** Runs parallel retrieval across Qdrant filtered by doc_id. Applies Cohere reranker (30–40% precision improvement). Applies MMR to eliminate redundant chunks.
 
----
+**Agent 3 — Synthesizer:** Generates grounded answers using only retrieved context. Every factual claim carries a citation. Refuses to answer when information is absent rather than hallucinating.
 
-### Recursive Email Parsing
-
-Emails frequently contain attachments — PDFs, Excel files, images. The email parser handles this by routing attachments back through `parse_document()`:
-
-```
-parse_document("memo.eml")
-    └── parse_email()
-            ├── Extracts body text → page 1
-            └── Finds attachment: "q4_earnings.pdf"
-                    └── parse_document("q4_earnings.pdf")   ← recursive call
-                            └── parse_pdf()
-                                    └── returns pages 1–47 of the PDF
-
-Final result: [email body] + [47 pages of the PDF attachment]
-```
-
-The recursion terminates naturally — attachments are not themselves emails with further attachments. The pipeline handles an email with any attachment type without any additional code — the router resolves the type automatically.
-
----
-
-### Key Design Decisions
-
-**Page-level granularity over full-document text**
-Each page is stored as a separate dict with its page number. This enables citations — when the system answers a question in Phase 2, it can point to "page 47 of the 10-K filing" rather than just "somewhere in the document." In financial contexts, cited sources are non-negotiable.
-
-**Tables converted at parse time, not query time**
-Table structure is converted to markdown during ingestion, not when a query arrives. Converting at parse time means it happens once per document. Converting at query time would mean doing it on every retrieval, adding latency to every user request.
-
-**Claude Vision for images, not Tesseract**
-Traditional OCR (Tesseract) works by matching pixel patterns to known character shapes. It fails on complex financial layouts — multi-column tables, bar charts, pie charts with labels, watermarked scanned documents. Claude Vision understands layout and context, can describe numerical data in charts, and handles degraded scan quality. For enterprise financial documents, accuracy matters more than avoiding an API call.
-
-**Reading order is preserved across all formats**
-Content is never extracted in separate type-passes and then concatenated. Separating all text from all images breaks contextual connections — "as shown in the chart above" placed 300 tokens away from the chart it references gives the LLM no useful signal. Every parser outputs content in the exact order a human would read it. The implementation method differs per format (y-coordinate sorting for PDF, XML body iteration for DOCX, DOM traversal for HTML, row-anchor interleaving for Excel) but the contract is the same: output order = visual reading order.
-
-**Pass count is determined by what content the format can contain**
-PDF and DOCX run 3 passes because they can mix text, tables, and embedded images on the same page simultaneously. Excel runs 2 passes — cell values (Pass 1) and embedded images extracted from the xlsx ZIP archive (Pass 2). HTML runs 2 passes — text content (Pass 1) and `<img>` tags resolved from base64 URIs, relative paths, or remote URLs (Pass 2). CSV runs 1 pass because the format is plain text by definition — images are impossible in CSV. Standalone image files run 1 pass — the entire file is sent to Claude Vision. The pass count matches what the format is actually capable of containing, nothing more.
-
-**Recursion only in email parsing, not in PDF or DOCX**
-PDF and DOCX always run the same 3 passes — no conditions, no branching. Email is different because the content type of its attachments is unknown at parse time. Rather than hardcoding handling for every possible attachment type inside the email parser, attachments are routed back through `parse_document()`. The router resolves the type automatically. This means an email with a PDF attachment, an Excel file, and an image all get parsed correctly without a single line of attachment-specific logic in `parse_email()`.
-
-**Single Qdrant collection with doc_id payload filter**
-All documents are stored in one Qdrant collection. Document isolation at query time is achieved via payload filtering on `doc_id`, not by creating separate collections per document. Separate collections would require separate index management and make cross-document queries impossible. One collection, filtered by payload, handles both single-document and cross-document retrieval with no architectural change.
-
----
+**Agent 4 — Evaluator:** Scores every response using RAGAS — faithfulness, answer relevance, context recall. Triggers Agent 2 retry with different retrieval parameters when scores fall below threshold. The system self-corrects.
 
 ---
 
@@ -173,28 +163,32 @@ All documents are stored in one Qdrant collection. Document isolation at query t
 
 | Layer | Technology | Why |
 |-------|-----------|-----|
-| Agent Orchestration | LangGraph | Stateful graphs, conditional edges, retry loops |
-| LLM | Anthropic Claude (claude-sonnet-4-6) | Best reasoning, reliable citations |
-| Embeddings | OpenAI text-embedding-3-large | Best retrieval performance at 3072 dimensions |
-| Vector Store | Qdrant (Docker, self-hosted) | HNSW index, payload filtering, open source |
-| Re-ranker | Cohere Rerank | Improves retrieval precision by 30–40% |
-| Evaluation | RAGAS | Industry standard RAG evaluation framework |
-| Tracing | LangSmith | Full agent trace visibility |
+| Agent Orchestration | LangGraph | Stateful graphs, conditional edges, self-correcting retry loops |
+| LLM | Anthropic Claude (claude-sonnet-4-6) | Best reasoning, reliable grounded citations |
+| Embeddings | OpenAI text-embedding-3-large | 3072-dimension vectors, best retrieval performance |
+| Vector Store | Qdrant (Docker) | HNSW index, payload filtering, open source |
+| Re-ranker | Cohere Rerank | Precision improvement over raw vector search |
+| Evaluation | RAGAS | Industry-standard RAG evaluation without ground truth |
+| Tracing | LangSmith | Full agent trace visibility per request |
 | Safety | Guardrails AI | PII redaction, prompt injection detection |
 | API | FastAPI | Production REST API |
-| Containerization | Docker + Docker Compose | Local dev parity with production |
+| Containerization | Docker + Docker Compose | Local/production environment parity |
 | Cloud | AWS Lambda + S3 | Serverless deployment, document storage |
 | Monitoring | Prometheus + Grafana | RAGAS score trends, latency, error rates |
-| CI/CD | GitHub Actions | Automated deploy on push to main |
+| CI/CD | GitHub Actions | Automated deploy on merge to main |
 
 ---
 
 ## Status
 
-**Phase 1 — In progress**
+**Phase 1 — Foundation**
 - [x] Project structure, Docker Compose, environment setup
-- [x] Document parser — all formats, 3-pass system
+- [x] Document parser — 9 formats, production edge cases handled
 - [ ] Chunker — fixed-size and semantic strategies
 - [ ] Embedder — OpenAI text-embedding-3-large
 - [ ] Qdrant ingestion + similarity search
-- [ ] Phase 1 milestone: end-to-end ingest and retrieve via Python script
+- [ ] Milestone: end-to-end ingest and retrieve via Python script
+
+**Phase 2 — Agents** (Week 2)
+**Phase 3 — Evaluation** (Week 3)
+**Phase 4 — Production Deployment** (Week 4)
