@@ -123,6 +123,97 @@ Email attachments are unknown format at parse time. Rather than branching on att
 
 ---
 
+## Chunker — Production-Grade Text Chunking
+
+After the parser extracts clean text, the chunker splits it into focused pieces
+that can each be embedded into a vector. Chunk size, strategy, and boundaries
+directly determine retrieval quality — a poorly chunked document produces answers
+that miss context, cut mid-sentence, or return the wrong section entirely.
+
+---
+
+### Two Strategies, Content-Aware Routing
+
+**Strategy A — Sentence-Aware Fixed-Size**
+
+The production workhorse. Text is split into 512-token chunks with 50 tokens of
+overlap, always respecting sentence boundaries. The overlap ensures that facts
+spanning a chunk boundary exist in full in at least one chunk.
+
+Used for: any document the classifier identifies as non-financial.
+Speed: fast enough for millions of documents per day.
+
+**Strategy B — Hierarchical (Parent-Child)**
+
+The same document text is stored at two levels simultaneously:
+
+- **Child chunks** (256 tokens, 30 overlap) — stored in Qdrant and searched.
+  Small = focused vector = precise retrieval.
+- **Parent chunks** (1024 tokens) — stored in PostgreSQL. Every child carries
+  a `parent_id` pointing to its parent. When a child is retrieved, the system
+  fetches the full parent and gives it to the LLM.
+
+The result: search precision of a small chunk, answer quality of a large chunk.
+Used for: any document the classifier identifies as financial or high-value.
+
+---
+
+### Content-Aware Routing — Not File Extension
+
+A naive router would look at the file extension and decide: PDF → hierarchical,
+CSV → fixed. This is wrong. A CSV can be a full balance sheet. An HTML page can
+be an SEC filing. The extension tells you the format, not the value of the content.
+
+The router reads the parsed text and classifies it by content. Three modes,
+switchable by environment variable with no code changes:
+
+**Keyword scoring (`CHUNK_CLASSIFIER=keyword`)**
+Regex scan for financial signals — currency values, percentage changes, financial
+terms (revenue, EBITDA, gross margin, 10-K). Score ≥ 3 signals → financial.
+Zero cost, zero API call, accurate for clear cases.
+
+**Claude Haiku (`CHUNK_CLASSIFIER=haiku`)**
+First 500 tokens sent to Claude Haiku with a classification prompt. Near-perfect
+accuracy because Haiku understands context — it distinguishes a document that
+mentions revenue once from a full earnings report. Cost is negligible at scale
+(~$0.00025 per 1000 tokens).
+
+**Local open-source model (`CHUNK_CLASSIFIER=local`)**
+A small model (Gemma 3 1B, Phi-3 Mini, GLM-4) runs locally via Ollama. Same
+classification prompt, zero external API call, complete data privacy. This is
+how regulated financial institutions handle sensitive document classification —
+the data never leaves their own infrastructure. A 1-4 GB model running on CPU
+handles binary classification in under a second with no GPU required.
+
+The chunker code does not change between modes. Only the environment variable changes.
+On a developer laptop: `haiku`. On AWS with client financial data: `local`.
+
+---
+
+### Every Chunk Carries Full Provenance
+
+```python
+{
+    "text": "...chunk content...",
+    "metadata": {
+        "file_name": "goldman_10k_2024.pdf",
+        "file_hash": "a3f9c2d8...",
+        "page": 4,
+        "chunk_index": 2,
+        "total_chunks": 47,
+        "strategy": "hierarchical_child",
+        "parent_id": "doc_001_parent_005",
+        "timestamp": "2024-03-15T10:23:00Z"
+    }
+}
+```
+
+Every chunk is permanently traceable to its source document, page, and position.
+The LLM can cite "Goldman Sachs 10-K 2024, page 4" because the metadata traveled
+with the chunk through every stage of the pipeline.
+
+---
+
 ## System Architecture
 
 ```
@@ -199,7 +290,7 @@ Email attachments are unknown format at parse time. Rather than branching on att
 **Phase 1 — Foundation**
 - [x] Project structure, Docker Compose, environment setup
 - [x] Document parser — 9 formats, production edge cases handled
-- [ ] Chunker — fixed-size and semantic strategies
+- [ ] Chunker — sentence-aware fixed-size + hierarchical, content-aware router
 - [ ] Embedder — OpenAI text-embedding-3-large
 - [ ] Qdrant ingestion + similarity search
 - [ ] Milestone: end-to-end ingest and retrieve via Python script
