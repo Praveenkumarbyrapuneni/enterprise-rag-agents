@@ -16,15 +16,16 @@ The parser is therefore the most critical correctness boundary in the system. It
 
 ### Supported Formats
 
-| Format | Tool | Notes |
-|--------|------|-------|
-| PDF | PyMuPDF | Text layer + table detection + embedded images |
-| DOCX | python-docx | Paragraphs + tables + embedded images |
-| Excel (.xlsx, .xls) | pandas + openpyxl | Each sheet = one page |
-| CSV | pandas | Entire file as one markdown table |
-| HTML | BeautifulSoup | Tags stripped, content preserved |
-| Images (.png, .jpg, .gif, .webp) | Claude Vision | OCR via vision LLM |
-| Email (.eml) | Python stdlib `email` | Body + attachments parsed recursively |
+| Format | Tool | Passes | Notes |
+|--------|------|--------|-------|
+| PDF | PyMuPDF | 3 | Text + tables + embedded images |
+| DOCX | python-docx | 3 | Text + tables + embedded images |
+| Excel (.xlsx) | pandas + zipfile | 2 | Cell values + embedded images from archive |
+| Excel (.xls) | pandas | 1 | Cell values only — legacy format, no image layer |
+| CSV | pandas | 1 | Entire file as markdown table, no images possible |
+| HTML | BeautifulSoup | 2 | Text + `<img>` tags (base64, relative path, remote URL) |
+| Images (.png, .jpg, .gif, .webp) | Claude Vision | 1 | Entire file is the image |
+| Email (.eml) | Python stdlib `email` | recursive | Body + all attachments parsed through router |
 
 ---
 
@@ -127,8 +128,8 @@ Table structure is converted to markdown during ingestion, not when a query arri
 **Claude Vision for images, not Tesseract**
 Traditional OCR (Tesseract) works by matching pixel patterns to known character shapes. It fails on complex financial layouts — multi-column tables, bar charts, pie charts with labels, watermarked scanned documents. Claude Vision understands layout and context, can describe numerical data in charts, and handles degraded scan quality. For enterprise financial documents, accuracy matters more than avoiding an API call.
 
-**3 passes only on PDF and DOCX, not other formats**
-PDF and DOCX are the only formats that can contain all three content types simultaneously on the same page — free text, embedded tables, and embedded images mixed together. A single page of a 10-K filing can have a paragraph, a revenue table, and a chart all at once. Every other format is inherently one content type: Excel is always tabular, an image file is always an image, HTML structures its content through tags handled in one pass, email body is always plain text. Applying 3 passes to formats that don't need it would add latency and API cost with no benefit.
+**Pass count is determined by what content the format can contain**
+PDF and DOCX run 3 passes because they can mix text, tables, and embedded images on the same page simultaneously. Excel runs 2 passes — cell values (Pass 1) and embedded images extracted from the xlsx ZIP archive (Pass 2). HTML runs 2 passes — text content (Pass 1) and `<img>` tags resolved from base64 URIs, relative paths, or remote URLs (Pass 2). CSV runs 1 pass because the format is plain text by definition — images are impossible in CSV. Standalone image files run 1 pass — the entire file is sent to Claude Vision. The pass count matches what the format is actually capable of containing, nothing more.
 
 **Recursion only in email parsing, not in PDF or DOCX**
 PDF and DOCX always run the same 3 passes — no conditions, no branching. Email is different because the content type of its attachments is unknown at parse time. Rather than hardcoding handling for every possible attachment type inside the email parser, attachments are routed back through `parse_document()`. The router resolves the type automatically. This means an email with a PDF attachment, an Excel file, and an image all get parsed correctly without a single line of attachment-specific logic in `parse_email()`.

@@ -18,7 +18,10 @@ import base64
 import email as email_lib
 import logging
 import os
+import re
 import tempfile
+import urllib.request
+import zipfile
 from email import policy
 from typing import Any, Dict, List
 
@@ -189,20 +192,49 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
 
 def parse_excel(file_path: str) -> List[Dict[str, Any]]:
     """
-    Excel — each sheet = one page, rendered as a markdown table.
+    Excel — 2 passes:
+        Pass 1: cell values per sheet → markdown table (pandas)
+        Pass 2: embedded images → Claude Vision (.xlsx only — xlsx is a ZIP archive,
+                images live in xl/media/. .xls is a legacy binary format with no
+                accessible image layer via this approach.)
 
-    Sheets are the natural unit of separation in Excel — each sheet typically
-    covers one topic (revenue, expenses, headcount). Keeping them separate
-    means a query about "headcount" doesn't get polluted by revenue chunks.
+    Each sheet = one page. Images appended to the last sheet's page.
+    ponytail: exact sheet-level image attribution requires drawing XML parsing —
+    appending to last sheet is correct enough for financial docs where images
+    are typically on summary/cover sheets.
     """
     xl = pd.ExcelFile(file_path)
     pages = []
+
+    # Pass 1 — cell values
     for sheet_num, sheet_name in enumerate(xl.sheet_names, start=1):
         df = xl.parse(sheet_name)
         if df.empty:
             continue
-        md = df.to_markdown(index=False)
-        pages.append({"page": sheet_num, "text": f"Sheet: {sheet_name}\n\n{md}"})
+        pages.append({"page": sheet_num, "text": f"Sheet: {sheet_name}\n\n{df.to_markdown(index=False)}"})
+
+    # Pass 2 — embedded images (xlsx = ZIP, images stored in xl/media/)
+    if file_path.lower().endswith(".xlsx"):
+        image_texts: List[str] = []
+        with zipfile.ZipFile(file_path, "r") as z:
+            media_files = [f for f in z.namelist() if f.startswith("xl/media/")]
+            for media_file in media_files:
+                try:
+                    img_bytes = z.read(media_file)
+                    ext = os.path.splitext(media_file)[1].lower().lstrip(".")
+                    media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+                    img_text = _extract_image_text(img_bytes, media_type)
+                    if img_text.strip():
+                        image_texts.append(f"[Image]\n{img_text}")
+                except Exception as e:
+                    logger.warning(f"Excel image extraction failed for {media_file}: {e}")
+
+        if image_texts:
+            if pages:
+                pages[-1]["text"] += "\n\n" + "\n\n".join(image_texts)
+            else:
+                pages.append({"page": 1, "text": "\n\n".join(image_texts)})
+
     return pages
 
 
@@ -214,17 +246,76 @@ def parse_csv(file_path: str) -> List[Dict[str, Any]]:
 
 def parse_html(file_path: str) -> List[Dict[str, Any]]:
     """
-    HTML — strip all tags, keep readable text.
+    HTML — 2 passes:
+        Pass 1: strip tags, keep readable text (BeautifulSoup)
+        Pass 2: <img> tags → Claude Vision
 
-    Removes nav, header, footer, scripts — noise that would pollute retrieval.
-    Keeps the main content body.
+    Three src types handled:
+      - data:image/... base64 URI → decode directly
+      - relative path            → read from disk relative to the HTML file
+      - http/https URL           → download (requires internet, skipped on failure)
     """
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "html.parser")
+
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
+
+    parts: List[str] = []
+
+    # Pass 1 — text
     lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
-    return [{"page": 1, "text": "\n".join(lines)}]
+    if lines:
+        parts.append("\n".join(lines))
+
+    # Pass 2 — images
+    base_dir = os.path.dirname(os.path.abspath(file_path))
+    media_type_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+    }
+
+    for img_tag in soup.find_all("img"):
+        src = img_tag.get("src", "").strip()
+        if not src:
+            continue
+        try:
+            if src.startswith("data:image/"):
+                # base64 data URI — no disk/network access needed
+                match = re.match(r"data:(image/\w+);base64,(.+)", src, re.DOTALL)
+                if match:
+                    img_text = _extract_image_text(
+                        base64.b64decode(match.group(2)), match.group(1)
+                    )
+                    if img_text.strip():
+                        parts.append(f"\n[Image]\n{img_text}")
+
+            elif src.startswith(("http://", "https://")):
+                # remote URL — download with timeout
+                with urllib.request.urlopen(src, timeout=10) as resp:
+                    img_bytes = resp.read()
+                ext = src.split(".")[-1].lower().split("?")[0]
+                media_type = media_type_map.get(ext, "image/png")
+                img_text = _extract_image_text(img_bytes, media_type)
+                if img_text.strip():
+                    parts.append(f"\n[Image]\n{img_text}")
+
+            else:
+                # relative file path
+                img_path = os.path.join(base_dir, src)
+                if os.path.exists(img_path):
+                    with open(img_path, "rb") as f:
+                        img_bytes = f.read()
+                    ext = os.path.splitext(src)[1].lower().lstrip(".")
+                    media_type = media_type_map.get(ext, "image/png")
+                    img_text = _extract_image_text(img_bytes, media_type)
+                    if img_text.strip():
+                        parts.append(f"\n[Image]\n{img_text}")
+
+        except Exception as e:
+            logger.warning(f"HTML image extraction failed for '{src}': {e}")
+
+    return [{"page": 1, "text": "\n".join(parts)}] if parts else []
 
 
 def parse_image(file_path: str) -> List[Dict[str, Any]]:
