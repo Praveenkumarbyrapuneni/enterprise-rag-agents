@@ -18,7 +18,7 @@ This parser was built against every failure mode that surfaces in real enterpris
 A fully scanned PDF page has no text layer. A naive parser calls `get_text()`, gets nothing, moves on. The page is gone. This parser detects zero-content pages after all extraction passes and renders the full page as a 150 DPI bitmap, then sends it to Claude Vision. Scanned annual reports, faxed documents, and legacy filings are fully recovered.
 
 **Wrong reading order on multi-column layouts**
-A naive parser sorts text blocks top-to-bottom across the full page width. On a two-column analyst report, this interleaves content from both columns — the LLM reads gibberish. This parser detects two-column layout by checking whether text blocks cluster in two groups across the page midpoint. Left column is output top-to-bottom, then right column — the order a human would read it.
+A naive parser sorts text blocks top-to-bottom across the full page width. On a two-column analyst report this interleaves content from both columns — the LLM reads gibberish. On a three-column academic paper the problem is worse. This parser detects any number of columns by finding gaps in the x-center distribution of text blocks — a gap wider than 8% of the page width with no text is a column gutter. Each column is output top-to-bottom, columns ordered left-to-right, exactly as a human reads it. Works for 1, 2, 3, or more columns without any hard-coded assumptions.
 
 **Context broken by separating images from their captions**
 A naive parser extracts all text first, all images last. "As shown in the chart above, revenue grew 23% YoY" is now 400 tokens away from the chart it references. This parser extracts content in exact visual reading order per page — text, image, text, table — sorted by y-coordinate. The chart and its caption are adjacent in the output.
@@ -73,7 +73,7 @@ The correct fix is detecting pages with significant vector drawing content and s
 
 | Format | Extraction |
 |--------|-----------|
-| PDF | Text + tables + images sorted by vertical position. Scanned pages rendered to bitmap. Two-column layout detected and reordered. Duplicate images deduplicated. |
+| PDF | Text + tables + images sorted by vertical position. Scanned pages rendered to bitmap. N-column layout auto-detected and reordered (any number of columns). Duplicate images deduplicated. |
 | DOCX | Body XML in document order. Inline images, floating text boxes, and embedded charts extracted at their paragraph. All section headers and footers included. |
 | Excel (.xlsx) | Cell values with merged regions filled. Native chart objects parsed from XML. Images and charts inserted at anchor row positions. |
 | Excel (.xls) | Cell values only — legacy binary format has no accessible drawing layer. |
@@ -115,7 +115,7 @@ Email attachments are unknown format at parse time. Rather than branching on att
 
 | Format | How reading order is achieved |
 |--------|------------------------------|
-| PDF | Text blocks, tables, images collected with x/y coordinates, sorted by y. Two-column detection reorders by column then y. |
+| PDF | Text blocks, tables, images collected with x/y coordinates, sorted by y. N-column detection via x-center gap analysis — any column count, reordered left-to-right then top-to-bottom per column. |
 | DOCX | Body XML iterated in document order. Images handled inside their parent paragraph, not in a separate pass. |
 | HTML | Single DOM traversal. Tables and images processed where they appear, not after all text. |
 | Excel | Drawing XML parsed for row anchor positions. Images and charts inserted at the row they visually belong to. |
@@ -126,6 +126,21 @@ Email attachments are unknown format at parse time. Rather than branching on att
 ## System Architecture
 
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    INGESTION PIPELINE                           │
+│                                                                 │
+│  Files arrive (any of 9 supported formats)                      │
+│       ↓                                                         │
+│  Hash check → PostgreSQL — duplicate? skip entirely            │
+│       ↓                                                         │
+│  Task queue → Celery + Redis (SQS on AWS)                       │
+│       ↓                                                         │
+│  Worker fleet — N parallel workers (ECS on AWS)                 │
+│    Parser → Chunker → Embedder → Qdrant uploader               │
+│    Every chunk carries: file, page, chunk_index, hash, ts       │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     FastAPI REST API                            │
 └─────────────────────────┬───────────────────────────────────────┘

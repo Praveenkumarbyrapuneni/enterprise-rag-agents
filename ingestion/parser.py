@@ -8,9 +8,10 @@ on the page. Text, tables, and images are interleaved so the LLM receives
 full context ("as shown in the chart above" stays next to the chart).
 
 Reading-order strategy per format:
-  PDF    — elements sorted by y-coordinate; multi-column layout detected and
-            handled; scanned pages rendered as full-page bitmap to Vision;
-            duplicate image xrefs deduplicated per page
+  PDF    — elements sorted by y-coordinate; N-column layout detected from
+            x-center gaps and handled correctly for any column count; scanned
+            pages rendered as full-page bitmap to Vision; duplicate image
+            xrefs deduplicated per page
   DOCX   — body XML iterated in document order; inline images, text boxes,
             and embedded charts handled inside their parent paragraph;
             headers/footers extracted from all sections
@@ -126,46 +127,85 @@ def _bbox_overlaps(b1: Tuple, b2: Tuple) -> bool:
 
 def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
     """
-    Return elements in correct visual reading order.
+    Return elements in correct visual reading order for N-column layouts.
 
-    Single column: sort all by y-coordinate.
-    Two column: detected when >= 25% of text blocks fall in each half of the
-    page width. Left column blocks output first, full-width elements next,
-    then right column blocks.
+    Column count is detected from gaps in the x-center distribution of text
+    blocks. A gap wider than 8% of the page width with no text indicates a
+    column gutter. Works for 1, 2, 3, or more columns.
+
+    Full-width elements (section headers, wide tables spanning ≥60% of page)
+    interrupt column flow: everything above them is emitted column-by-column
+    first, then the full-width element, then the content below it.
+
+    Within each column band, content is ordered top-to-bottom per column,
+    columns ordered left-to-right.
     """
     if not elements:
         return []
 
-    mid = page_width / 2
-
     def cx(e: Dict) -> float:
         return (e.get("x0", 0) + e.get("x1", e.get("x0", 0))) / 2
 
-    text_els = [e for e in elements if e.get("etype") == "text"]
-    non_text = [e for e in elements if e.get("etype") != "text"]
+    def el_width(e: Dict) -> float:
+        return e.get("x1", e.get("x0", 0)) - e.get("x0", 0)
 
+    text_els = [e for e in elements if e.get("etype") == "text"]
     if not text_els:
         return sorted(elements, key=lambda e: e["y"])
 
-    left_text = [e for e in text_els if cx(e) < mid]
-    right_text = [e for e in text_els if cx(e) >= mid]
-    total = len(text_els)
+    # Sort all text block x-centers; gaps > 8% of page width are column gutters
+    centers = sorted(cx(e) for e in text_els)
+    gap_threshold = page_width * 0.08
+    boundaries = [0.0]
+    for i in range(1, len(centers)):
+        if centers[i] - centers[i - 1] > gap_threshold:
+            boundaries.append((centers[i - 1] + centers[i]) / 2)
+    boundaries.append(page_width)
 
-    is_two_col = total >= 4 and len(left_text) / total >= 0.25 and len(right_text) / total >= 0.25
+    num_cols = len(boundaries) - 1
 
-    if not is_two_col:
+    # Need at least 2 blocks per detected column to trust the detection
+    if num_cols == 1 or len(text_els) < num_cols * 2:
         return sorted(elements, key=lambda e: e["y"])
 
-    full_w = page_width * 0.6
-    full_width_els = [e for e in non_text if (e.get("x1", 0) - e.get("x0", 0)) >= full_w]
-    left_non = [e for e in non_text if (e.get("x1", 0) - e.get("x0", 0)) < full_w and cx(e) < mid]
-    right_non = [e for e in non_text if (e.get("x1", 0) - e.get("x0", 0)) < full_w and cx(e) >= mid]
+    # Classify each element: full-width (spans ≥60% of page) or column-specific
+    full_w_threshold = page_width * 0.6
 
-    return (
-        sorted(left_text + left_non, key=lambda e: e["y"]) +
-        sorted(full_width_els, key=lambda e: e["y"]) +
-        sorted(right_text + right_non, key=lambda e: e["y"])
-    )
+    def col_of(e: Dict) -> int:
+        if el_width(e) >= full_w_threshold:
+            return -1  # full-width sentinel
+        c = cx(e)
+        for i in range(num_cols):
+            if boundaries[i] <= c < boundaries[i + 1]:
+                return i
+        return num_cols - 1
+
+    full_width_els = sorted([e for e in elements if col_of(e) == -1], key=lambda e: e["y"])
+    column_els = [e for e in elements if col_of(e) != -1]
+
+    cols: List[List[Dict]] = [[] for _ in range(num_cols)]
+    for e in column_els:
+        cols[col_of(e)].append(e)
+    for col in cols:
+        col.sort(key=lambda e: e["y"])
+
+    # Emit all columns (left→right) for elements whose y falls within a band
+    result: List[Dict] = []
+
+    def emit_band(y_lo: float, y_hi: float) -> None:
+        for col in cols:
+            for e in col:
+                if y_lo <= e["y"] < y_hi:
+                    result.append(e)
+
+    prev_y = float("-inf")
+    for fw_el in full_width_els:
+        emit_band(prev_y, fw_el["y"])
+        result.append(fw_el)
+        prev_y = fw_el["y"]
+
+    emit_band(prev_y, float("inf"))
+    return result
 
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
@@ -181,6 +221,7 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
     - Same image xref processed only once per page (deduplication).
     - Password-protected PDFs raise a clear ValueError.
     - Scanned pages (zero content extracted) rendered as full-page bitmap → Vision.
+    - N-column layouts handled: column count auto-detected, any count supported.
 
     Known limitation: vector graphics (charts drawn as PDF path instructions)
     are invisible. No fix without rendering every page — too expensive.
