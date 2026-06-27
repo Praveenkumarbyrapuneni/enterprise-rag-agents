@@ -11,8 +11,7 @@ build/
 data/
 
 # local-only files — never push
-concept_learnings.md
-parser_learnings.md
+learnings/
 building_steps.md
 MEMORY.md
 CLAUDE.md
