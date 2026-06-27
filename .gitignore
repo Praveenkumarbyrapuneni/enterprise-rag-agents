@@ -13,3 +13,5 @@ data/
 # local-only files — never push
 concept_learnings.md
 building_steps.md
+MEMORY.md
+CLAUDE.md
