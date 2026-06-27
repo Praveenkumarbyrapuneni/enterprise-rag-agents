@@ -35,35 +35,35 @@ All parsers extract content in the exact visual reading order it appears on the 
 
 ```
 PDF — per page:
-    Collect all text blocks      → each has a y-coordinate (vertical position)
-    Collect all tables           → each has a y-coordinate
-    Collect all embedded images  → each has a y-coordinate → sent to Claude Vision
-    Sort everything by y-coordinate
-    Output: content exactly as a human reads the page, top to bottom
-
-    Text blocks overlapping with table regions are excluded to avoid
-    duplicating table content (PyMuPDF returns table cells as text blocks too).
-    Images smaller than 50×50px are skipped (decorative icons, borders).
+    Collect text blocks, tables, and images each with x and y coordinates.
+    Multi-column detection: if ≥25% of text blocks fall in each half of the
+    page width, treat as two-column layout — left column output first
+    (sorted by y), full-width elements next, then right column (sorted by y).
+    Single-column: all elements sorted by y.
+    Text blocks overlapping table regions excluded (avoid duplication).
+    Images < 50×50px skipped (decorative icons, borders).
+    Scanned page fallback: if zero content extracted after all passes,
+    the page is rendered as a full bitmap at 150 DPI and sent to Claude Vision.
+    This recovers scanned PDFs that have no text layer at all.
 
 DOCX — document order:
-    Walk the body XML element by element in document order.
-    Each element is either a paragraph (<w:p>) or a table (<w:tbl>).
-    Images in DOCX are inline — they live inside paragraphs.
-    When a paragraph is encountered, its text AND any inline images
-    are extracted together, in the order they appear within the paragraph.
+    Headers extracted from doc.sections[0].header — prepended before body.
+    Body XML iterated element by element in document order.
+    Each element is a paragraph (<w:p>) or a table (<w:tbl>).
+    Images in DOCX are inline inside paragraphs — extracted at the paragraph
+    they belong to, preserving their position relative to surrounding text.
+    Footers extracted from doc.sections[0].footer — appended after body.
 
-HTML — DOM traversal order:
-    Walk the DOM tree once, top to bottom.
-    Text nodes and <img> elements collected as encountered.
-    No separate passes — an image between two paragraphs appears
-    between those paragraphs in the output.
+HTML — DOM traversal:
+    Walk the DOM tree once. Text and <img> elements collected as encountered.
     <img> src resolved from: base64 data URI / relative file path / remote URL.
 
-Excel — row-position interleaving:
-    Cell values extracted as markdown table (row by row).
-    Images extracted from xlsx ZIP archive (xl/media/).
-    Each image's row anchor parsed from drawing XML inside the archive.
-    Image text inserted into the table output after the row it appears next to.
+Excel — drawing XML parsing:
+    Drawings XML (xl/drawings/drawing*.xml) parsed for both images AND native
+    chart objects. Native charts (bar, line, pie, etc.) were previously invisible
+    — chart XML (xl/charts/chart*.xml) is now parsed to extract title, series
+    names, category labels, and cached values formatted as markdown tables.
+    Both images and charts inserted at their row anchor position in the sheet output.
 ```
 
 ---
@@ -146,15 +146,6 @@ PDF and DOCX always run the same 3 passes — no conditions, no branching. Email
 All documents are stored in one Qdrant collection. Document isolation at query time is achieved via payload filtering on `doc_id`, not by creating separate collections per document. Separate collections would require separate index management and make cross-document queries impossible. One collection, filtered by payload, handles both single-document and cross-document retrieval with no architectural change.
 
 ---
-
-### Known Gaps (Tracked, Not Yet Fixed)
-
-| Gap | Impact | Plan |
-|-----|--------|------|
-| Scanned PDFs — pages that are entirely images with no text layer — Pass 1 returns empty but the page is not detected and sent to Claude Vision | High | Detect empty text layer, fall back to full-page Vision |
-| Multi-column PDF layout — PyMuPDF reads columns left-to-right incorrectly, mixing content across columns | Medium | Detect multi-column layout via block x-positions, re-order |
-| Excel native chart objects — Excel charts are not images, they are chart objects invisible to our ZIP image extraction | Medium | Use openpyxl chart API to describe chart data |
-| DOCX headers and footers — content in header/footer sections is skipped | Low | Extract via `doc.sections[0].header` |
 
 ---
 
