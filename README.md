@@ -127,6 +127,12 @@ Table structure is converted to markdown during ingestion, not when a query arri
 **Claude Vision for images, not Tesseract**
 Traditional OCR (Tesseract) works by matching pixel patterns to known character shapes. It fails on complex financial layouts — multi-column tables, bar charts, pie charts with labels, watermarked scanned documents. Claude Vision understands layout and context, can describe numerical data in charts, and handles degraded scan quality. For enterprise financial documents, accuracy matters more than avoiding an API call.
 
+**3 passes only on PDF and DOCX, not other formats**
+PDF and DOCX are the only formats that can contain all three content types simultaneously on the same page — free text, embedded tables, and embedded images mixed together. A single page of a 10-K filing can have a paragraph, a revenue table, and a chart all at once. Every other format is inherently one content type: Excel is always tabular, an image file is always an image, HTML structures its content through tags handled in one pass, email body is always plain text. Applying 3 passes to formats that don't need it would add latency and API cost with no benefit.
+
+**Recursion only in email parsing, not in PDF or DOCX**
+PDF and DOCX always run the same 3 passes — no conditions, no branching. Email is different because the content type of its attachments is unknown at parse time. Rather than hardcoding handling for every possible attachment type inside the email parser, attachments are routed back through `parse_document()`. The router resolves the type automatically. This means an email with a PDF attachment, an Excel file, and an image all get parsed correctly without a single line of attachment-specific logic in `parse_email()`.
+
 **Single Qdrant collection with doc_id payload filter**
 All documents are stored in one Qdrant collection. Document isolation at query time is achieved via payload filtering on `doc_id`, not by creating separate collections per document. Separate collections would require separate index management and make cross-document queries impossible. One collection, filtered by payload, handles both single-document and cross-document retrieval with no architectural change.
 
