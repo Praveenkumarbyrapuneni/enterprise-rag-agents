@@ -16,16 +16,17 @@ The parser is therefore the most critical correctness boundary in the system. It
 
 ### Supported Formats
 
-| Format | Tool | Passes | Notes |
-|--------|------|--------|-------|
-| PDF | PyMuPDF | 3 | Text + tables + embedded images |
-| DOCX | python-docx | 3 | Text + tables + embedded images |
-| Excel (.xlsx) | pandas + zipfile | 2 | Cell values + embedded images from archive |
-| Excel (.xls) | pandas | 1 | Cell values only — legacy format, no image layer |
-| CSV | pandas | 1 | Entire file as markdown table, no images possible |
-| HTML | BeautifulSoup | 2 | Text + `<img>` tags (base64, relative path, remote URL) |
-| Images (.png, .jpg, .gif, .webp) | Claude Vision | 1 | Entire file is the image |
-| Email (.eml) | Python stdlib `email` | recursive | Body + all attachments parsed through router |
+| Format | Tool | Notes |
+|--------|------|-------|
+| PDF | PyMuPDF | Text + tables + images sorted by y-position per page |
+| DOCX | python-docx | Text + tables + images/textboxes/charts in XML order; headers/footers |
+| Excel (.xlsx) | pandas + zipfile | Cells (merged filled) + images + native charts at anchor rows |
+| Excel (.xls) | pandas | Cell values only — legacy binary format |
+| CSV | pandas | Auto-detects delimiter and encoding; markdown table output |
+| HTML | BeautifulSoup | DOM walk: text + tables (markdown) + images in document order |
+| Images (.png, .jpg, .gif, .webp) | Claude Vision | Entire file sent to Vision |
+| TIFF (.tif, .tiff) | Pillow + Claude Vision | Each frame → PNG → Vision; multi-frame support |
+| Email (.eml) | Python stdlib `email` | Body + cid: inline images + attachments (recursive) |
 
 ---
 
@@ -55,15 +56,33 @@ DOCX — document order:
     Footers extracted from doc.sections[0].footer — appended after body.
 
 HTML — DOM traversal:
-    Walk the DOM tree once. Text and <img> elements collected as encountered.
-    <img> src resolved from: base64 data URI / relative file path / remote URL.
+    Walk the DOM tree once. Text, <img> elements, and <table> elements collected
+    as encountered. Tables converted to markdown (not raw text) to preserve
+    column relationships. <img> src resolved from base64 data URI, relative
+    file path, or remote URL.
 
 Excel — drawing XML parsing:
-    Drawings XML (xl/drawings/drawing*.xml) parsed for both images AND native
-    chart objects. Native charts (bar, line, pie, etc.) were previously invisible
-    — chart XML (xl/charts/chart*.xml) is now parsed to extract title, series
-    names, category labels, and cached values formatted as markdown tables.
-    Both images and charts inserted at their row anchor position in the sheet output.
+    Merged cells forward-filled before markdown conversion (prevents NaN output
+    from merged header rows common in financial spreadsheets).
+    Drawings XML parsed for both images (a:blip) and native chart objects (c:chart).
+    Chart XML parsed for cached title, series names, categories, and values.
+    All embedded content inserted at their anchor row in the table output.
+
+Email — cid: inline image resolution:
+    Before processing the body, all MIME parts with Content-ID headers collected
+    into a map. HTML body walked with DOM traversal — when <img src="cid:...">
+    is encountered, the Content-ID is matched to the map and bytes sent to Vision.
+    Attachments parsed recursively through the router.
+
+TIFF — multi-frame support:
+    Claude Vision does not accept TIFF natively. Each frame converted to PNG
+    via Pillow. Multi-page TIFF files (common for scanned document batches)
+    produce one output page per frame.
+
+Known limitation:
+    PDF vector graphics — charts drawn as mathematical path instructions are
+    invisible to both text extraction and image extraction. Selective rendering
+    of vector-only page regions is the correct fix but not yet implemented.
 ```
 
 ---
@@ -73,13 +92,14 @@ Excel — drawing XML parsing:
 ```python
 parse_document(file_path)   # only function the rest of the system calls
     │
-    ├── .pdf   → parse_pdf()
-    ├── .docx  → parse_docx()
-    ├── .xlsx  → parse_excel()
-    ├── .csv   → parse_csv()
-    ├── .html  → parse_html()
-    ├── .png / .jpg / .webp → parse_image()
-    └── .eml   → parse_email()
+    ├── .pdf         → parse_pdf()
+    ├── .docx        → parse_docx()
+    ├── .xlsx/.xls   → parse_excel()
+    ├── .csv         → parse_csv()
+    ├── .html/.htm   → parse_html()
+    ├── .png/.jpg/.gif/.webp → parse_image()
+    ├── .tif/.tiff   → parse_tiff()
+    └── .eml         → parse_email()
 ```
 
 Nothing in the pipeline calls `parse_pdf()` or `parse_excel()` directly. Everything goes through `parse_document()`.

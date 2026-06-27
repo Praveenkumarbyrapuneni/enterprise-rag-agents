@@ -9,18 +9,29 @@ full context ("as shown in the chart above" stays next to the chart).
 
 Reading-order strategy per format:
   PDF    — elements sorted by y-coordinate; multi-column layout detected and
-            handled (left column top-to-bottom, then right column);
-            scanned pages (empty text layer) rendered as full-page image to Vision
-  DOCX   — body XML iterated in document order; inline images handled inside
-            their parent paragraph; headers/footers extracted
-  HTML   — DOM tree walked in traversal order; one pass, no separation
-  Excel  — drawing XML parsed for image AND native chart positions;
-            content inserted at anchor row in the markdown table output
-  Others — inherently single-type content; reading order not applicable
+            handled; scanned pages rendered as full-page bitmap to Vision;
+            duplicate image xrefs deduplicated per page
+  DOCX   — body XML iterated in document order; inline images, text boxes,
+            and embedded charts handled inside their parent paragraph;
+            headers/footers extracted from all sections
+  HTML   — DOM tree walked in traversal order; tables converted to markdown;
+            images resolved from base64, relative path, or remote URL
+  Excel  — merged cells forward-filled; drawing XML parsed for images and
+            native charts; content inserted at anchor row positions
+  Email  — cid: inline images in HTML body resolved from MIME parts;
+            attachments parsed recursively through router
+  TIFF   — multi-frame support; each frame converted to PNG via Pillow
+  CSV    — delimiter and encoding auto-detected
+
+Known limitation:
+  PDF vector graphics — charts drawn as mathematical path instructions are
+  invisible to text extraction and image extraction. No clean fix without
+  rendering every page as a bitmap (expensive). Flagged, not fixed.
 """
 
 import base64
 import email as email_lib
+import io
 import logging
 import os
 import re
@@ -42,6 +53,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# DOCX namespace constants for chart and text box extraction
+_DOCX_CHART_ELEM = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
+_DOCX_R_ID_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -115,13 +130,8 @@ def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
 
     Single column: sort all by y-coordinate.
     Two column: detected when >= 25% of text blocks fall in each half of the
-    page width. Left column blocks (sorted by y) output first, then full-width
-    elements (tables/images spanning > 60% of page width, sorted by y), then
-    right column blocks (sorted by y).
-
-    ponytail: two-column detection uses page midpoint as boundary — sufficient
-    for standard two-column financial reports; irregular layouts may not sort
-    perfectly. Upgrade to x-coordinate clustering if needed.
+    page width. Left column blocks output first, full-width elements next,
+    then right column blocks.
     """
     if not elements:
         return []
@@ -146,7 +156,6 @@ def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
     if not is_two_col:
         return sorted(elements, key=lambda e: e["y"])
 
-    # Separate non-text into full-width vs column-specific
     full_w = page_width * 0.6
     full_width_els = [e for e in non_text if (e.get("x1", 0) - e.get("x0", 0)) >= full_w]
     left_non = [e for e in non_text if (e.get("x1", 0) - e.get("x0", 0)) < full_w and cx(e) < mid]
@@ -164,17 +173,27 @@ def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
 
 def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
     """
-    PDF — reading-order extraction with four passes resolved into one sorted list.
+    PDF — reading-order extraction per page.
 
-    Per page:
-    1. Collect text blocks (excluding regions covered by tables) with x, y positions.
-    2. Collect tables with their bounding box positions.
-    3. Collect images (> 50×50px) with positions → sent to Claude Vision.
-    4. Sort all elements by reading order (handles single and two-column layouts).
-    5. If page is empty after all passes → render full page as image → Claude Vision.
-       This handles scanned PDFs where pages are images with no text layer.
+    - Text blocks, tables, images collected with x/y positions and sorted.
+    - Text blocks overlapping table regions excluded to avoid duplication.
+    - Images < 50×50px skipped (decorative icons, borders).
+    - Same image xref processed only once per page (deduplication).
+    - Password-protected PDFs raise a clear ValueError.
+    - Scanned pages (zero content extracted) rendered as full-page bitmap → Vision.
+
+    Known limitation: vector graphics (charts drawn as PDF path instructions)
+    are invisible. No fix without rendering every page — too expensive.
     """
     doc = fitz.open(file_path)
+
+    if doc.is_encrypted:
+        doc.close()
+        raise ValueError(
+            f"PDF is password-protected and cannot be parsed: {file_path}. "
+            "Decrypt it before ingestion."
+        )
+
     pages = []
 
     for page_num, page in enumerate(doc, start=1):
@@ -183,7 +202,7 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
         tables = list(page.find_tables())
         table_bboxes = [t.bbox for t in tables]
 
-        # Text blocks — skip regions that belong to tables (avoid duplication)
+        # Text blocks — exclude regions that belong to detected tables
         for block in page.get_text("blocks"):
             x0, y0, x1, y1, text, _, block_type = block
             if block_type != 0 or not text.strip():
@@ -200,11 +219,15 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
                 b = table.bbox
                 elements.append({"etype": "table", "y": b[1], "x0": b[0], "x1": b[2], "content": f"[Table]\n{md}"})
 
-        # Images (skip decorative elements smaller than 50×50px)
+        # Images — deduplicated by xref so the same image isn't sent to Vision twice
+        seen_xrefs: set = set()
         for img_info in page.get_image_info():
             if img_info.get("width", 0) < 50 or img_info.get("height", 0) < 50:
                 continue
             xref = img_info["xref"]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
             b = img_info["bbox"]
             try:
                 img_data = doc.extract_image(xref)
@@ -214,9 +237,8 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
             except Exception as e:
                 logger.warning(f"PDF page {page_num} image extraction failed: {e}")
 
-        # Scanned page fallback: if nothing was extracted, the page is likely a
-        # full-page scan with no text layer. Render the page as a bitmap and
-        # send it to Claude Vision to recover all content.
+        # Scanned page fallback — if zero content extracted, the page has no text
+        # layer. Render it as a full-page bitmap and send to Claude Vision.
         if not elements:
             try:
                 pix = page.get_pixmap(dpi=150)
@@ -241,8 +263,57 @@ def _docx_header_footer_text(hf_obj) -> str:
     """Extract plain text from a DOCX header or footer object."""
     if hf_obj.is_linked_to_previous:
         return ""
-    lines = [p.text.strip() for p in hf_obj.paragraphs if p.text.strip()]
-    return "\n".join(lines)
+    return "\n".join(p.text.strip() for p in hf_obj.paragraphs if p.text.strip())
+
+
+def _docx_extract_drawing(drawing_elem, doc: Document, parts: List[str]) -> None:
+    """
+    Extract all content from a DOCX drawing element — images, text boxes, charts.
+
+    Called for every <w:drawing> found in a paragraph, preserving the order
+    in which these elements appear within the paragraph.
+    """
+    # Images — referenced via a:blip
+    for blip in drawing_elem.findall(".//" + qn("a:blip")):
+        r_id = blip.get(qn("r:embed"))
+        if r_id and r_id in doc.part.rels:
+            rel = doc.part.rels[r_id]
+            if "image" in rel.reltype:
+                try:
+                    ext = rel.target_ref.split(".")[-1].lower()
+                    img_text = _extract_image_text(rel.target_part.blob, _media_type(ext))
+                    if img_text.strip():
+                        parts.append(f"[Image]\n{img_text}")
+                except Exception as e:
+                    logger.warning(f"DOCX image extraction failed: {e}")
+
+    # Text boxes — floating callout boxes, sidebars, highlighted stat boxes
+    # stored as w:txbxContent inside wps:txbx inside the drawing
+    for txbx in drawing_elem.findall(".//" + qn("w:txbxContent")):
+        txbx_lines = []
+        for p_elem in txbx.findall(".//" + qn("w:p")):
+            try:
+                para = DocxParagraph(p_elem, doc)
+                if para.text.strip():
+                    txbx_lines.append(para.text.strip())
+            except Exception:
+                pass
+        if txbx_lines:
+            parts.append("[Text box]\n" + "\n".join(txbx_lines))
+
+    # Embedded charts — Excel charts embedded in Word documents
+    # referenced via c:chart element with r:id pointing to chart part
+    for chart_elem in drawing_elem.findall(f".//{_DOCX_CHART_ELEM}"):
+        r_id = chart_elem.get(_DOCX_R_ID_ATTR)
+        if r_id and r_id in doc.part.rels:
+            rel = doc.part.rels[r_id]
+            if "chart" in rel.reltype:
+                try:
+                    chart_text = _parse_chart_xml(rel.target_part.blob)
+                    if chart_text.strip():
+                        parts.append(f"[Chart]\n{chart_text}")
+                except Exception as e:
+                    logger.warning(f"DOCX chart extraction failed: {e}")
 
 
 def parse_docx(file_path: str) -> List[Dict[str, Any]]:
@@ -250,23 +321,25 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
     DOCX — reading-order extraction via body XML iteration.
 
     Extracts in document order:
-    - Headers (from first section — financial docs rarely have per-section headers)
+    - Headers (all sections)
     - Body: paragraphs and tables interleaved as they appear in the XML
-    - Inline images extracted inside the paragraph they belong to, in order
-    - Footers (from first section)
+      - Each paragraph: text + any inline images, text boxes, or charts
+    - Footers (all sections)
 
     DOCX has no stored page numbers. Everything returns as page 1.
     """
     doc = Document(file_path)
     parts: List[str] = []
 
-    # Headers — prepend before body content
-    if doc.sections:
-        header_text = _docx_header_footer_text(doc.sections[0].header)
-        if header_text:
-            parts.append(f"[Header]\n{header_text}")
+    # Headers — all sections (some financial docs have per-chapter headers)
+    seen_headers: set = set()
+    for section in doc.sections:
+        text = _docx_header_footer_text(section.header)
+        if text and text not in seen_headers:
+            parts.append(f"[Header]\n{text}")
+            seen_headers.add(text)
 
-    # Body: iterate XML in document order
+    # Body — iterate XML elements in document order
     for element in doc.element.body:
         tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
 
@@ -275,20 +348,9 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
             if para.text.strip():
                 parts.append(para.text.strip())
 
-            # Inline images live inside paragraphs — handle here to preserve order
+            # All drawing content (images, text boxes, charts) in this paragraph
             for drawing in element.findall(".//" + qn("w:drawing")):
-                for blip in drawing.findall(".//" + qn("a:blip")):
-                    r_id = blip.get(qn("r:embed"))
-                    if r_id and r_id in doc.part.rels:
-                        rel = doc.part.rels[r_id]
-                        if "image" in rel.reltype:
-                            try:
-                                ext = rel.target_ref.split(".")[-1].lower()
-                                img_text = _extract_image_text(rel.target_part.blob, _media_type(ext))
-                                if img_text.strip():
-                                    parts.append(f"[Image]\n{img_text}")
-                            except Exception as e:
-                                logger.warning(f"DOCX image extraction failed: {e}")
+                _docx_extract_drawing(drawing, doc, parts)
 
         elif tag == "tbl":
             table = DocxTable(element, doc)
@@ -297,11 +359,13 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
             if md:
                 parts.append(f"[Table]\n{md}")
 
-    # Footers — append after body content
-    if doc.sections:
-        footer_text = _docx_header_footer_text(doc.sections[0].footer)
-        if footer_text:
-            parts.append(f"[Footer]\n{footer_text}")
+    # Footers — all sections, deduplicated
+    seen_footers: set = set()
+    for section in doc.sections:
+        text = _docx_header_footer_text(section.footer)
+        if text and text not in seen_footers:
+            parts.append(f"[Footer]\n{text}")
+            seen_footers.add(text)
 
     return [{"page": 1, "text": "\n\n".join(parts)}] if parts else []
 
@@ -311,15 +375,10 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
 
 def _parse_chart_xml(chart_bytes: bytes) -> str:
     """
-    Extract data from an Excel native chart XML (xl/charts/chart*.xml).
+    Extract data from an Excel/DOCX chart XML.
 
-    Excel caches chart data inside the chart XML on save. We extract:
-    - Chart title
-    - Chart type (bar, line, pie, etc.)
-    - Each data series: name, category labels, and values → markdown table
-
-    This makes native chart objects visible to the LLM — previously they were
-    completely invisible to any parsing approach since they are not image files.
+    Charts cache their data in XML on save. Extracts title, chart type,
+    and each series with category labels and values as markdown tables.
     """
     ns = {
         "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
@@ -329,7 +388,6 @@ def _parse_chart_xml(chart_bytes: bytes) -> str:
     root = ET.fromstring(chart_bytes)
     parts: List[str] = []
 
-    # Chart title
     title_parts = (
         [t.text.strip() for t in root.findall(".//c:title//a:t", ns) if t.text] +
         [t.text.strip() for t in root.findall(".//c:title//c:v", ns) if t.text]
@@ -337,16 +395,14 @@ def _parse_chart_xml(chart_bytes: bytes) -> str:
     if title_parts:
         parts.append(f"Chart: {' '.join(title_parts)}")
 
-    # Detect chart type for context
     chart_type_tags = ["barChart", "lineChart", "pieChart", "scatterChart",
                        "areaChart", "doughnutChart", "radarChart", "bubbleChart"]
     for ct in chart_type_tags:
         if root.find(f".//c:{ct}", ns) is not None:
             if not title_parts:
-                parts.append(f"{ct.replace('Chart', ' Chart').title()}")
+                parts.append(ct.replace("Chart", " Chart").title())
             break
 
-    # Extract each series
     for ser in root.findall(".//c:ser", ns):
         series_name = ""
         for v in ser.findall(".//c:tx//c:v", ns):
@@ -382,16 +438,10 @@ def _parse_chart_xml(chart_bytes: bytes) -> str:
 
 def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
     """
-    Extract all embedded content (images AND native charts) from xlsx with
-    their row anchor positions.
+    Extract all embedded content (images and native charts) from xlsx
+    with their row anchor positions.
 
     Returns: List of (row_index, text_content) sorted by row_index.
-
-    xlsx structure explored:
-    - xl/drawings/drawing*.xml           → anchor positions + rId references
-    - xl/drawings/_rels/drawing*.xml.rels → rId → image or chart file
-    - xl/media/image*.png etc            → image files
-    - xl/charts/chart*.xml              → chart data XML
     """
     results: List[Tuple[int, str]] = []
 
@@ -413,7 +463,6 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
             if drawing_path not in all_files:
                 break
 
-            # Map rId → (file_path, "image"|"chart")
             r_id_map: Dict[str, Tuple[str, str]] = {}
             if rels_path in all_files:
                 for rel in ET.fromstring(z.read(rels_path)):
@@ -435,7 +484,6 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
                         if row_elem is not None and row_elem.text:
                             row = int(row_elem.text)
 
-                    # Images — referenced via a:blip
                     for blip in anchor.findall(".//a:blip", ns):
                         r_id = blip.get(r_embed, "")
                         if r_id in r_id_map and r_id_map[r_id][1] == "image":
@@ -449,7 +497,6 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
                                 except Exception as e:
                                     logger.warning(f"Excel image extraction failed: {e}")
 
-                    # Charts — referenced via c:chart element
                     for chart_ref in anchor.findall(".//c:chart", ns):
                         r_id = chart_ref.get(r_embed, "")
                         if r_id in r_id_map and r_id_map[r_id][1] == "chart":
@@ -468,13 +515,22 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
 
 def parse_excel(file_path: str) -> List[Dict[str, Any]]:
     """
-    Excel — cell values as markdown table with images and native charts
-    inserted at their row anchor positions.
+    Excel — cell values as markdown table with images and charts at anchor rows.
 
-    Each sheet = one page. .xls (legacy binary) — cell values only,
-    no drawing content extraction (not a ZIP archive).
+    Merged cells are forward-filled so NaN does not appear where a merged
+    header logically covers multiple rows or columns.
+    Password-protected files raise a clear ValueError.
     """
-    xl = pd.ExcelFile(file_path)
+    try:
+        xl = pd.ExcelFile(file_path)
+    except Exception as e:
+        err = str(e).lower()
+        if any(k in err for k in ("password", "encrypted", "xlrd", "openpyxl")):
+            raise ValueError(
+                f"Excel file appears to be password-protected or encrypted: {file_path}"
+            ) from e
+        raise
+
     pages = []
 
     drawing_content: List[Tuple[int, str]] = []
@@ -489,8 +545,11 @@ def parse_excel(file_path: str) -> List[Dict[str, Any]]:
         parts: List[str] = [f"Sheet: {sheet_name}"]
 
         if not df.empty:
+            # Forward-fill merged cell areas (NaN in merged regions → cell value)
+            df = df.ffill(axis=0).ffill(axis=1).fillna("")
+
             md_lines = df.to_markdown(index=False).split("\n")
-            result_lines = md_lines[:2]  # header + separator
+            result_lines = md_lines[:2]
 
             for data_row_idx, line in enumerate(md_lines[2:]):
                 result_lines.append(line)
@@ -500,7 +559,6 @@ def parse_excel(file_path: str) -> List[Dict[str, Any]]:
 
             parts.append("\n".join(result_lines))
 
-            # Content anchored beyond the last data row
             last_row = len(md_lines) - 3
             for row_anchor, embedded_text in drawing_content:
                 if row_anchor > last_row:
@@ -516,8 +574,14 @@ def parse_excel(file_path: str) -> List[Dict[str, Any]]:
 
 
 def parse_csv(file_path: str) -> List[Dict[str, Any]]:
-    """CSV — rows as markdown table. Images are impossible in this format."""
-    df = pd.read_csv(file_path)
+    """
+    CSV — auto-detects delimiter (comma, tab, semicolon, pipe) and encoding.
+    Falls back from UTF-8 to Latin-1 on decode errors.
+    """
+    try:
+        df = pd.read_csv(file_path, sep=None, engine="python", encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(file_path, sep=None, engine="python", encoding="latin-1")
     return [{"page": 1, "text": df.to_markdown(index=False)}]
 
 
@@ -525,7 +589,7 @@ def parse_csv(file_path: str) -> List[Dict[str, Any]]:
 
 
 def _resolve_html_image(src: str, base_dir: str) -> str:
-    """Resolve any img src type (base64, relative path, remote URL) → Vision text."""
+    """Resolve img src (base64 data URI / relative path / remote URL) → Vision text."""
     mt_map = {
         "jpg": "image/jpeg", "jpeg": "image/jpeg",
         "png": "image/png", "gif": "image/gif", "webp": "image/webp",
@@ -543,12 +607,13 @@ def _resolve_html_image(src: str, base_dir: str) -> str:
             return _extract_image_text(img_bytes, mt_map.get(ext, "image/png"))
 
         else:
-            img_path = os.path.join(base_dir, src)
-            if os.path.exists(img_path):
-                with open(img_path, "rb") as f:
-                    img_bytes = f.read()
-                ext = os.path.splitext(src)[1].lower().lstrip(".")
-                return _extract_image_text(img_bytes, mt_map.get(ext, "image/png"))
+            if base_dir:
+                img_path = os.path.join(base_dir, src)
+                if os.path.exists(img_path):
+                    with open(img_path, "rb") as f:
+                        img_bytes = f.read()
+                    ext = os.path.splitext(src)[1].lower().lstrip(".")
+                    return _extract_image_text(img_bytes, mt_map.get(ext, "image/png"))
 
     except Exception as e:
         logger.warning(f"HTML image resolution failed for '{src}': {e}")
@@ -558,7 +623,8 @@ def _resolve_html_image(src: str, base_dir: str) -> str:
 def _walk_html(node: Any, base_dir: str, parts: List[str]) -> None:
     """
     Walk the HTML DOM in document order.
-    Text and images collected as encountered — no separate passes.
+    Text, images, and tables collected as encountered — no separate passes.
+    Tables converted to markdown to preserve column relationships.
     """
     if isinstance(node, NavigableString):
         text = str(node).strip()
@@ -571,6 +637,19 @@ def _walk_html(node: Any, base_dir: str, parts: List[str]) -> None:
                 img_text = _resolve_html_image(src, base_dir)
                 if img_text.strip():
                     parts.append(f"[Image]\n{img_text}")
+
+        elif node.name == "table":
+            # Convert HTML table to markdown — walking as text loses structure
+            rows = []
+            for tr in node.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                md = _rows_to_markdown(rows)
+                if md:
+                    parts.append(f"[Table]\n{md}")
+
         else:
             for child in node.children:
                 _walk_html(child, base_dir, parts)
@@ -580,7 +659,7 @@ def _walk_html(node: Any, base_dir: str, parts: List[str]) -> None:
 
 
 def parse_html(file_path: str) -> List[Dict[str, Any]]:
-    """HTML — DOM-order traversal. One walk, text and images interleaved."""
+    """HTML — one DOM walk, text/tables/images interleaved in document order."""
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "html.parser")
 
@@ -611,13 +690,105 @@ def parse_image(file_path: str) -> List[Dict[str, Any]]:
     return [{"page": 1, "text": text}]
 
 
+# ── TIFF ──────────────────────────────────────────────────────────────────────
+
+
+def parse_tiff(file_path: str) -> List[Dict[str, Any]]:
+    """
+    TIFF — multi-page scanned document format common in financial document scanning.
+
+    Claude Vision does not accept TIFF natively. Each frame is converted to
+    PNG via Pillow and then sent to Vision. Multi-frame TIFFs (document batches
+    scanned as a single file) have each frame extracted as a separate page.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError(
+            "Pillow is required for TIFF parsing: pip install pillow"
+        )
+
+    pages = []
+    with Image.open(file_path) as img:
+        frame = 0
+        while True:
+            try:
+                img.seek(frame)
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="PNG")
+                img_text = _extract_image_text(buf.getvalue(), "image/png")
+                if img_text.strip():
+                    pages.append({"page": frame + 1, "text": img_text})
+                frame += 1
+            except EOFError:
+                break
+
+    return pages
+
+
 # ── Email ─────────────────────────────────────────────────────────────────────
+
+
+def _walk_html_email(
+    node: Any,
+    cid_images: Dict[str, Tuple[bytes, str]],
+    parts: List[str],
+) -> None:
+    """
+    Walk HTML email body in DOM order, resolving cid: inline image references.
+
+    Corporate HTML emails embed images as MIME parts referenced via
+    cid: scheme (<img src="cid:uniqueid@domain">). This walker matches
+    those references to the collected MIME parts and sends them to Vision.
+    """
+    if isinstance(node, NavigableString):
+        text = str(node).strip()
+        if text:
+            parts.append(text)
+    elif isinstance(node, Tag):
+        if node.name == "img":
+            src = node.get("src", "").strip()
+            if src.startswith("cid:"):
+                cid = src[4:]  # strip "cid:" prefix
+                if cid in cid_images:
+                    img_bytes, media_type = cid_images[cid]
+                    try:
+                        img_text = _extract_image_text(img_bytes, media_type)
+                        if img_text.strip():
+                            parts.append(f"[Image]\n{img_text}")
+                    except Exception as e:
+                        logger.warning(f"Email cid image extraction failed for '{cid}': {e}")
+            elif src:
+                img_text = _resolve_html_image(src, "")
+                if img_text.strip():
+                    parts.append(f"[Image]\n{img_text}")
+
+        elif node.name == "table":
+            rows = []
+            for tr in node.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                md = _rows_to_markdown(rows)
+                if md:
+                    parts.append(f"[Table]\n{md}")
+
+        else:
+            for child in node.children:
+                _walk_html_email(child, cid_images, parts)
+            if node.name in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+                             "li", "tr", "br", "section", "article"):
+                parts.append("")
 
 
 def parse_email(file_path: str) -> List[Dict[str, Any]]:
     """
-    .eml — body text + attachments parsed recursively through parse_document().
-    Any attachment type is handled automatically without format-specific logic here.
+    .eml — body + attachments parsed recursively through parse_document().
+
+    cid: inline images in HTML email bodies are resolved by first collecting
+    all MIME parts that have a Content-ID header, then matching cid: references
+    in the HTML body to those parts during DOM traversal.
     """
     with open(file_path, "rb") as f:
         msg = email_lib.message_from_binary_file(f, policy=policy.default)
@@ -627,6 +798,16 @@ def parse_email(file_path: str) -> List[Dict[str, Any]]:
         f"Date: {msg.get('date', '')}\n"
         f"Subject: {msg.get('subject', '')}\n\n"
     )
+
+    # Collect all inline images by Content-ID before processing body
+    cid_images: Dict[str, Tuple[bytes, str]] = {}
+    for part in msg.walk():
+        content_id = part.get("Content-ID", "")
+        if content_id and part.get_content_maintype() == "image":
+            cid = content_id.strip("<>")
+            img_data = part.get_payload(decode=True)
+            if img_data:
+                cid_images[cid] = (img_data, part.get_content_type())
 
     body_parts: List[str] = []
     attachment_pages: List[Dict[str, Any]] = []
@@ -655,9 +836,18 @@ def parse_email(file_path: str) -> List[Dict[str, Any]]:
 
         elif content_type == "text/plain":
             body_parts.append(part.get_content())
+
         elif content_type == "text/html":
             soup = BeautifulSoup(part.get_content(), "html.parser")
-            body_parts.append(soup.get_text(separator="\n"))
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            email_parts: List[str] = []
+            _walk_html_email(soup, cid_images, email_parts)
+            text = "\n".join(
+                line for line in "\n".join(email_parts).splitlines() if line.strip()
+            )
+            if text:
+                body_parts.append(text)
 
     body = header + "\n".join(body_parts)
     return [{"page": 1, "text": body}] + attachment_pages
@@ -685,6 +875,8 @@ def parse_document(file_path: str) -> List[Dict[str, Any]]:
         ".jpeg": parse_image,
         ".gif":  parse_image,
         ".webp": parse_image,
+        ".tif":  parse_tiff,
+        ".tiff": parse_tiff,
         ".eml":  parse_email,
     }
     parser_fn = parsers.get(ext)
