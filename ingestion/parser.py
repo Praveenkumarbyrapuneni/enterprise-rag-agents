@@ -235,6 +235,7 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
             "Decrypt it before ingestion."
         )
 
+    logger.info(f"[{file_path}] parsing PDF — {doc.page_count} pages")
     pages = []
 
     for page_num, page in enumerate(doc, start=1):
@@ -276,7 +277,7 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
                 if img_text.strip():
                     elements.append({"etype": "image", "y": b[1], "x0": b[0], "x1": b[2], "content": f"[Image]\n{img_text}"})
             except Exception as e:
-                logger.warning(f"PDF page {page_num} image extraction failed: {e}")
+                logger.warning(f"[{file_path}] page {page_num} image extraction failed: {type(e).__name__}: {e}")
 
         # Scanned page fallback — if zero content extracted, the page has no text
         # layer. Render it as a full-page bitmap and send to Claude Vision.
@@ -287,13 +288,14 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
                 if img_text.strip():
                     elements.append({"etype": "image", "y": 0, "x0": 0, "x1": page.rect.width, "content": f"[Scanned page]\n{img_text}"})
             except Exception as e:
-                logger.warning(f"PDF page {page_num} scanned-page render failed: {e}")
+                logger.warning(f"[{file_path}] page {page_num} scanned-page render failed: {type(e).__name__}: {e}")
 
         ordered = _reading_order(elements, page.rect.width)
         if ordered:
             pages.append({"page": page_num, "text": "\n\n".join(e["content"] for e in ordered)})
 
     doc.close()
+    logger.info(f"[{file_path}] parsed: {len(pages)} pages with content")
     return pages
 
 
@@ -307,7 +309,9 @@ def _docx_header_footer_text(hf_obj) -> str:
     return "\n".join(p.text.strip() for p in hf_obj.paragraphs if p.text.strip())
 
 
-def _docx_extract_drawing(drawing_elem, doc: Document, parts: List[str]) -> None:
+def _docx_extract_drawing(
+    drawing_elem, doc: Document, parts: List[str], file_path: str
+) -> None:
     """
     Extract all content from a DOCX drawing element — images, text boxes, charts.
 
@@ -326,7 +330,7 @@ def _docx_extract_drawing(drawing_elem, doc: Document, parts: List[str]) -> None
                     if img_text.strip():
                         parts.append(f"[Image]\n{img_text}")
                 except Exception as e:
-                    logger.warning(f"DOCX image extraction failed: {e}")
+                    logger.warning(f"[{file_path}] DOCX image extraction failed: {type(e).__name__}: {e}")
 
     # Text boxes — floating callout boxes, sidebars, highlighted stat boxes
     # stored as w:txbxContent inside wps:txbx inside the drawing
@@ -337,8 +341,8 @@ def _docx_extract_drawing(drawing_elem, doc: Document, parts: List[str]) -> None
                 para = DocxParagraph(p_elem, doc)
                 if para.text.strip():
                     txbx_lines.append(para.text.strip())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[{file_path}] DOCX text box paragraph skipped: {type(e).__name__}: {e}")
         if txbx_lines:
             parts.append("[Text box]\n" + "\n".join(txbx_lines))
 
@@ -354,7 +358,7 @@ def _docx_extract_drawing(drawing_elem, doc: Document, parts: List[str]) -> None
                     if chart_text.strip():
                         parts.append(f"[Chart]\n{chart_text}")
                 except Exception as e:
-                    logger.warning(f"DOCX chart extraction failed: {e}")
+                    logger.warning(f"[{file_path}] DOCX chart extraction failed: {type(e).__name__}: {e}")
 
 
 def parse_docx(file_path: str) -> List[Dict[str, Any]]:
@@ -391,7 +395,7 @@ def parse_docx(file_path: str) -> List[Dict[str, Any]]:
 
             # All drawing content (images, text boxes, charts) in this paragraph
             for drawing in element.findall(".//" + qn("w:drawing")):
-                _docx_extract_drawing(drawing, doc, parts)
+                _docx_extract_drawing(drawing, doc, parts, file_path)
 
         elif tag == "tbl":
             table = DocxTable(element, doc)
@@ -536,7 +540,7 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
                                     if img_text.strip():
                                         results.append((row, f"[Image]\n{img_text}"))
                                 except Exception as e:
-                                    logger.warning(f"Excel image extraction failed: {e}")
+                                    logger.warning(f"[{file_path}] Excel image extraction failed: {type(e).__name__}: {e}")
 
                     for chart_ref in anchor.findall(".//c:chart", ns):
                         r_id = chart_ref.get(r_embed, "")
@@ -548,7 +552,7 @@ def _excel_drawing_content(file_path: str) -> List[Tuple[int, str]]:
                                     if chart_text.strip():
                                         results.append((row, f"[Chart]\n{chart_text}"))
                                 except Exception as e:
-                                    logger.warning(f"Excel chart extraction failed: {e}")
+                                    logger.warning(f"[{file_path}] Excel chart extraction failed: {type(e).__name__}: {e}")
 
     results.sort(key=lambda x: x[0])
     return results
@@ -579,7 +583,7 @@ def parse_excel(file_path: str) -> List[Dict[str, Any]]:
         try:
             drawing_content = _excel_drawing_content(file_path)
         except Exception as e:
-            logger.warning(f"Excel drawing content extraction failed: {e}")
+            logger.warning(f"[{file_path}] Excel drawing content extraction failed — images and charts may be missing: {type(e).__name__}: {e}")
 
     for sheet_num, sheet_name in enumerate(xl.sheet_names, start=1):
         df = xl.parse(sheet_name)
@@ -657,7 +661,7 @@ def _resolve_html_image(src: str, base_dir: str) -> str:
                     return _extract_image_text(img_bytes, mt_map.get(ext, "image/png"))
 
     except Exception as e:
-        logger.warning(f"HTML image resolution failed for '{src}': {e}")
+        logger.warning(f"HTML image resolution failed for src='{src}': {type(e).__name__}: {e}")
     return ""
 
 
@@ -798,7 +802,7 @@ def _walk_html_email(
                         if img_text.strip():
                             parts.append(f"[Image]\n{img_text}")
                     except Exception as e:
-                        logger.warning(f"Email cid image extraction failed for '{cid}': {e}")
+                        logger.warning(f"[{file_path}] email cid image extraction failed for cid='{cid}': {type(e).__name__}: {e}")
             elif src:
                 img_text = _resolve_html_image(src, "")
                 if img_text.strip():
@@ -871,7 +875,7 @@ def parse_email(file_path: str) -> List[Dict[str, Any]]:
                     ap["source_attachment"] = filename
                     attachment_pages.append(ap)
             except Exception as e:
-                logger.warning(f"Could not parse attachment '{filename}': {e}")
+                logger.warning(f"[{file_path}] attachment '{filename}' failed to parse: {type(e).__name__}: {e}")
             finally:
                 os.unlink(tmp_path)
 
@@ -901,6 +905,9 @@ def parse_document(file_path: str) -> List[Dict[str, Any]]:
     """
     Single entry point. Detects format by extension, routes to specialist.
     Adding a new format = write one function + add one line in parsers dict.
+
+    Logs entry, success, and failure with full file context so any error
+    in the pipeline can be traced to the exact file and stage that caused it.
     """
     ext = os.path.splitext(file_path)[1].lower()
     parsers = {
@@ -923,4 +930,23 @@ def parse_document(file_path: str) -> List[Dict[str, Any]]:
     parser_fn = parsers.get(ext)
     if not parser_fn:
         raise ValueError(f"Unsupported format '{ext}'. Supported: {sorted(parsers.keys())}")
-    return parser_fn(file_path)
+
+    try:
+        result = parser_fn(file_path)
+        if not result:
+            logger.warning(
+                f"[{file_path}] PARSE WARNING: parser returned 0 pages — "
+                "file may be empty, corrupted, or contain only unsupported content"
+            )
+        else:
+            logger.info(
+                f"[{file_path}] PARSE SUCCESS: {len(result)} pages, "
+                f"{sum(len(p['text'].split()) for p in result)} words extracted"
+            )
+        return result
+    except Exception as e:
+        logger.error(
+            f"[{file_path}] PARSE FAILED at stage=parser format={ext}: "
+            f"{type(e).__name__}: {e}"
+        )
+        raise

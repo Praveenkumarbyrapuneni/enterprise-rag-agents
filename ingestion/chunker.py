@@ -107,7 +107,7 @@ def _keyword_score(text: str) -> bool:
     return (keyword_hits + currency_hits + percent_hits) >= 3
 
 
-def _haiku_classify(text: str) -> bool:
+def _haiku_classify(text: str, file_name: str) -> bool:
     """
     Ask Claude Haiku to classify the document.
     Haiku understands context — distinguishes a passing mention of revenue
@@ -134,11 +134,14 @@ def _haiku_classify(text: str) -> bool:
         )
         return response.content[0].text.strip().upper().startswith("YES")
     except Exception as e:
-        logger.warning(f"Haiku classifier failed: {e}. Falling back to keyword scoring.")
+        logger.warning(
+            f"[{file_name}] Haiku classifier failed: {type(e).__name__}: {e}. "
+            "Falling back to keyword scoring."
+        )
         return _keyword_score(text)
 
 
-def _local_classify(text: str) -> bool:
+def _local_classify(text: str, file_name: str) -> bool:
     """
     Ask a local open-source model via Ollama to classify the document.
 
@@ -166,11 +169,14 @@ def _local_classify(text: str) -> bool:
         )
         return response["message"]["content"].strip().upper().startswith("YES")
     except Exception as e:
-        logger.warning(f"Local classifier unavailable: {e}. Falling back to keyword scoring.")
+        logger.warning(
+            f"[{file_name}] Local classifier unavailable: {type(e).__name__}: {e}. "
+            "Falling back to keyword scoring."
+        )
         return _keyword_score(text)
 
 
-def _is_financial(pages: List[Dict[str, Any]]) -> bool:
+def _is_financial(pages: List[Dict[str, Any]], file_name: str) -> bool:
     """
     Route to the correct classifier based on CHUNK_CLASSIFIER env var.
 
@@ -184,11 +190,14 @@ def _is_financial(pages: List[Dict[str, Any]]) -> bool:
     if mode == "keyword":
         return _keyword_score(full_text)
     elif mode == "haiku":
-        return _haiku_classify(full_text)
+        return _haiku_classify(full_text, file_name)
     elif mode == "local":
-        return _local_classify(full_text)
+        return _local_classify(full_text, file_name)
     else:
-        logger.warning(f"Unknown CHUNK_CLASSIFIER='{mode}'. Falling back to keyword scoring.")
+        logger.warning(
+            f"[{file_name}] Unknown CHUNK_CLASSIFIER='{mode}'. "
+            "Falling back to keyword scoring."
+        )
         return _keyword_score(full_text)
 
 
@@ -416,17 +425,36 @@ def chunk_document(
                                 (default: "gemma3:1b")
     """
     if not pages:
-        logger.warning(f"chunk_document called with empty pages for {file_name}")
+        logger.warning(
+            f"[{file_name}] CHUNK WARNING: called with 0 pages — "
+            "parser may have returned empty result, check parse logs for this file"
+        )
         return {"chunks": [], "parents": []}
 
-    financial = _is_financial(pages)
-    strategy = "hierarchical" if financial else "fixed"
-    logger.info(
-        f"{file_name}: classified as {'financial' if financial else 'standard'} "
-        f"→ strategy={strategy} "
-        f"via CHUNK_CLASSIFIER={os.getenv('CHUNK_CLASSIFIER', 'haiku')}"
-    )
+    try:
+        financial = _is_financial(pages, file_name)
+        strategy = "hierarchical" if financial else "fixed"
+        logger.info(
+            f"[{file_name}] chunking — classified={'financial' if financial else 'standard'} "
+            f"strategy={strategy} "
+            f"classifier={os.getenv('CHUNK_CLASSIFIER', 'haiku')}"
+        )
 
-    if strategy == "hierarchical":
-        return _strategy_hierarchical(pages, file_name, file_hash)
-    return _strategy_fixed(pages, file_name, file_hash)
+        result = (
+            _strategy_hierarchical(pages, file_name, file_hash)
+            if strategy == "hierarchical"
+            else _strategy_fixed(pages, file_name, file_hash)
+        )
+
+        logger.info(
+            f"[{file_name}] CHUNK SUCCESS: {len(result['chunks'])} chunks, "
+            f"{len(result['parents'])} parents — strategy={strategy}"
+        )
+        return result
+
+    except Exception as e:
+        logger.error(
+            f"[{file_name}] CHUNK FAILED at stage=chunker: "
+            f"{type(e).__name__}: {e}"
+        )
+        raise
