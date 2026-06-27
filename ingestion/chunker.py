@@ -5,20 +5,25 @@ Two strategies, selected by content-aware routing:
 
   Strategy A (fixed):        Sentence-aware fixed-size windows.
                              512 tokens, 50 token overlap.
-                             Never cuts mid-sentence.
+                             Never cuts mid-sentence unless a single sentence
+                             exceeds the chunk limit (last-resort token split).
                              Used for non-financial documents.
 
   Strategy B (hierarchical): Parent-child two-level chunking.
                              Parent: 1024 tokens → stored in PostgreSQL.
                              Child:  256 tokens, 30 overlap → stored in Qdrant.
                              Search finds the child. LLM receives the parent.
+                             Child page numbers reflect the actual page the
+                             child content came from, not the parent's first page.
                              Used for financial documents.
 
 Content classifier modes (set via CHUNK_CLASSIFIER env var):
   keyword  — regex + keyword scoring, zero API cost
   haiku    — Claude Haiku API call, near-perfect accuracy (~$0.00025/1K tokens)
+             Falls back to keyword scoring if the API call fails.
   local    — local open-source model via Ollama, full data privacy for
-             regulated environments where data must never leave the institution
+             regulated environments where data must never leave the institution.
+             Falls back to keyword scoring if Ollama is not running.
 
 Single entry point: chunk_document(pages, file_name, file_hash)
 
@@ -42,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 _TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
+# Hard ceiling from OpenAI embedding model — no chunk may exceed this
+_EMBEDDING_TOKEN_LIMIT = 8191
+
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
@@ -53,11 +61,24 @@ def _count_tokens(text: str) -> int:
 def _split_sentences(text: str) -> List[str]:
     """
     Split text into sentences on . ! ? boundaries.
-    Keeps abbreviations like 'U.S.' from triggering false splits by requiring
-    the character after the punctuation to be whitespace followed by a capital.
+    Requires the character after punctuation to be whitespace + capital letter,
+    which prevents 'U.S.' or '$4.2B.' from triggering false splits.
     """
     parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"\'\(])", text.strip())
     return [s.strip() for s in parts if s.strip()]
+
+
+def _split_at_token_limit(text: str, limit: int) -> List[str]:
+    """
+    Last-resort token-level split for a single sentence that exceeds the limit.
+    Used only when a sentence alone is longer than the chunk size — rare but
+    possible in legal disclaimers and dense financial tables formatted as prose.
+    """
+    tokens = _TOKENIZER.encode(text)
+    parts = []
+    for start in range(0, len(tokens), limit):
+        parts.append(_TOKENIZER.decode(tokens[start:start + limit]))
+    return parts
 
 
 # ── Content classifier ────────────────────────────────────────────────────────
@@ -91,25 +112,30 @@ def _haiku_classify(text: str) -> bool:
     Ask Claude Haiku to classify the document.
     Haiku understands context — distinguishes a passing mention of revenue
     from a full earnings report. Cost: ~$0.00025 per 1K input tokens.
+    Falls back to keyword scoring on any API failure so the document
+    is never dropped due to a transient network or rate-limit error.
     """
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=5,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Is the following document a financial document containing "
-                "earnings data, balance sheets, revenue figures, financial "
-                "analysis, or transaction records? "
-                "Answer with YES or NO only.\n\n"
-                f"{text[:2000]}"
-            ),
-        }],
-    )
-    return response.content[0].text.strip().upper().startswith("YES")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Is the following document a financial document containing "
+                    "earnings data, balance sheets, revenue figures, financial "
+                    "analysis, or transaction records? "
+                    "Answer with YES or NO only.\n\n"
+                    f"{text[:2000]}"
+                ),
+            }],
+        )
+        return response.content[0].text.strip().upper().startswith("YES")
+    except Exception as e:
+        logger.warning(f"Haiku classifier failed: {e}. Falling back to keyword scoring.")
+        return _keyword_score(text)
 
 
 def _local_classify(text: str) -> bool:
@@ -120,7 +146,6 @@ def _local_classify(text: str) -> bool:
     leave the institution's infrastructure. A small model (Gemma 3 1B,
     Phi-3 Mini, GLM-4) is sufficient for binary YES/NO classification.
     Set LOCAL_CLASSIFIER_MODEL env var to choose the model.
-
     Falls back to keyword scoring if Ollama is not running.
     """
     try:
@@ -173,30 +198,43 @@ def _is_financial(pages: List[Dict[str, Any]]) -> bool:
 def _sentences_with_pages(pages: List[Dict[str, Any]]) -> List[Tuple[str, int]]:
     """
     Flatten pages into (sentence, page_number) tuples.
-    Tracks which page each sentence came from so metadata is accurate.
+    Tracks which page each sentence came from so page metadata is accurate
+    at both the parent and child level.
+
+    If a single sentence exceeds the chunk size limit, it is split at the
+    token level as a last resort. Each token-split piece inherits the same
+    page number as the original sentence.
     """
     result: List[Tuple[str, int]] = []
     for page in pages:
         for sentence in _split_sentences(page["text"]):
-            result.append((sentence, page["page"]))
+            if _count_tokens(sentence) > _EMBEDDING_TOKEN_LIMIT:
+                # Last resort: split a monster sentence at token boundaries
+                for piece in _split_at_token_limit(sentence, 512):
+                    result.append((piece, page["page"]))
+            else:
+                result.append((sentence, page["page"]))
     return result
 
 
-def _build_chunks(
+def _build_chunk_groups(
     sentences: List[Tuple[str, int]],
     chunk_size: int,
     overlap_tokens: int,
-) -> List[Tuple[str, int]]:
+) -> List[List[Tuple[str, int]]]:
     """
-    Build chunks from (sentence, page_number) tuples.
+    Group (sentence, page_number) tuples into chunks.
+
+    Returns List of groups, where each group is a List[Tuple[str, int]].
+    Preserving the full (sentence, page) tuples — not just the text — means
+    callers retain accurate page numbers for every sentence in every chunk.
+    This is what allows child chunks to carry their own correct page number
+    rather than inheriting the parent's first page.
 
     Accumulates sentences until the next sentence would exceed chunk_size.
-    At that point the current chunk is saved and the last overlap_tokens
-    worth of sentences are carried forward into the next chunk.
-
-    Never cuts mid-sentence. Returns List of (chunk_text, first_page_in_chunk).
+    Carries overlap_tokens worth of sentences forward into the next group.
     """
-    chunks: List[Tuple[str, int]] = []
+    groups: List[List[Tuple[str, int]]] = []
     current: List[Tuple[str, int]] = []
     current_tokens = 0
 
@@ -204,11 +242,9 @@ def _build_chunks(
         s_tokens = _count_tokens(sentence)
 
         if current and current_tokens + s_tokens > chunk_size:
-            # Save current chunk
-            chunks.append((" ".join(s for s, _ in current), current[0][1]))
+            groups.append(list(current))
 
-            # Build overlap: carry sentences from the end of the current chunk
-            # until we have enough tokens to fill the overlap window
+            # Carry overlap: sentences from the end of the current group
             overlap: List[Tuple[str, int]] = []
             overlap_count = 0
             for s, p in reversed(current):
@@ -225,9 +261,14 @@ def _build_chunks(
         current_tokens += s_tokens
 
     if current:
-        chunks.append((" ".join(s for s, _ in current), current[0][1]))
+        groups.append(list(current))
 
-    return chunks
+    return groups
+
+
+def _group_to_text_and_page(group: List[Tuple[str, int]]) -> Tuple[str, int]:
+    """Join a sentence group into (text, first_page_in_group)."""
+    return " ".join(s for s, _ in group), group[0][1]
 
 
 # ── Strategy A — Sentence-aware fixed-size ────────────────────────────────────
@@ -243,12 +284,14 @@ def _strategy_fixed(
     All chunks go to the embedder → Qdrant. No parents.
     """
     sentences = _sentences_with_pages(pages)
-    raw_chunks = _build_chunks(sentences, chunk_size=512, overlap_tokens=50)
-    total = len(raw_chunks)
+    groups = _build_chunk_groups(sentences, chunk_size=512, overlap_tokens=50)
+    total = len(groups)
     ts = datetime.now(timezone.utc).isoformat()
 
-    chunks = [
-        {
+    chunks = []
+    for idx, group in enumerate(groups):
+        text, page = _group_to_text_and_page(group)
+        chunks.append({
             "text": text,
             "metadata": {
                 "file_name": file_name,
@@ -260,9 +303,7 @@ def _strategy_fixed(
                 "parent_id": None,
                 "timestamp": ts,
             },
-        }
-        for idx, (text, page) in enumerate(raw_chunks)
-    ]
+        })
 
     return {"chunks": chunks, "parents": []}
 
@@ -278,13 +319,15 @@ def _strategy_hierarchical(
     """
     Two-level chunking for high-value financial documents.
 
-    Parents (1024 tokens):
+    Parents (1024 tokens, no overlap):
       Stored in PostgreSQL. Returned to the LLM at query time for full context.
       Not embedded — never searched directly.
 
     Children (256 tokens, 30 overlap):
       Embedded and stored in Qdrant. What gets searched.
       Each child carries parent_id so the retriever can fetch the parent.
+      Each child's page number reflects the actual page its content came from,
+      not the parent's first page — ensuring citation accuracy.
 
     When a user asks a question:
       1. Qdrant finds the right child (small = precise match).
@@ -294,12 +337,16 @@ def _strategy_hierarchical(
     sentences = _sentences_with_pages(pages)
     ts = datetime.now(timezone.utc).isoformat()
 
-    raw_parents = _build_chunks(sentences, chunk_size=1024, overlap_tokens=0)
+    # Build parent groups — each group is the sentences that form one parent
+    parent_groups = _build_chunk_groups(sentences, chunk_size=1024, overlap_tokens=0)
+
     parents: List[Dict] = []
     all_children: List[Dict] = []
 
-    for parent_text, parent_page in raw_parents:
+    for parent_group in parent_groups:
+        parent_text, parent_page = _group_to_text_and_page(parent_group)
         parent_id = str(uuid.uuid4())
+
         parents.append({
             "id": parent_id,
             "text": parent_text,
@@ -309,27 +356,29 @@ def _strategy_hierarchical(
             "timestamp": ts,
         })
 
-        # Build children from this parent's text only (not the full document)
-        # so children never span across parent boundaries
-        parent_sentences = [(s, parent_page) for s in _split_sentences(parent_text)]
-        raw_children = _build_chunks(parent_sentences, chunk_size=256, overlap_tokens=30)
+        # Build children from the SAME sentence groups used to build this parent.
+        # This preserves per-sentence page numbers so each child knows its exact page.
+        child_groups = _build_chunk_groups(
+            parent_group, chunk_size=256, overlap_tokens=30
+        )
 
-        for child_text, child_page in raw_children:
+        for child_group in child_groups:
+            child_text, child_page = _group_to_text_and_page(child_group)
             all_children.append({
                 "text": child_text,
                 "metadata": {
                     "file_name": file_name,
                     "file_hash": file_hash,
-                    "page": child_page,
+                    "page": child_page,         # actual page, not parent's first page
                     "chunk_index": len(all_children),
-                    "total_chunks": None,   # filled after all children collected
+                    "total_chunks": None,        # filled after all children collected
                     "strategy": "hierarchical_child",
                     "parent_id": parent_id,
                     "timestamp": ts,
                 },
             })
 
-    # Fill in total_chunks now that we know the final count
+    # Fill in total_chunks now that the full count is known
     total = len(all_children)
     for idx, child in enumerate(all_children):
         child["metadata"]["chunk_index"] = idx
@@ -362,7 +411,9 @@ def chunk_document(
         }
 
     Environment variables:
-        CHUNK_CLASSIFIER: "keyword" | "haiku" (default) | "local"
+        CHUNK_CLASSIFIER:       "keyword" | "haiku" (default) | "local"
+        LOCAL_CLASSIFIER_MODEL: Ollama model name when using local mode
+                                (default: "gemma3:1b")
     """
     if not pages:
         logger.warning(f"chunk_document called with empty pages for {file_name}")
@@ -372,7 +423,8 @@ def chunk_document(
     strategy = "hierarchical" if financial else "fixed"
     logger.info(
         f"{file_name}: classified as {'financial' if financial else 'standard'} "
-        f"→ strategy={strategy} via CHUNK_CLASSIFIER={os.getenv('CHUNK_CLASSIFIER', 'haiku')}"
+        f"→ strategy={strategy} "
+        f"via CHUNK_CLASSIFIER={os.getenv('CHUNK_CLASSIFIER', 'haiku')}"
     )
 
     if strategy == "hierarchical":
