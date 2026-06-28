@@ -75,7 +75,9 @@ _EMBEDDING_TOKEN_LIMIT = 8191
 
 
 def _count_tokens(text: str) -> int:
-    return len(_TOKENIZER.encode(text))
+    # disallowed_special=() prevents ValueError on special tokens like <|endoftext|>
+    # which appear in SEC filings and corrupted PDFs (same fix applied in embedder).
+    return len(_TOKENIZER.encode(text, disallowed_special=()))
 
 
 _ABBREVS_RE = re.compile(
@@ -112,7 +114,7 @@ def _split_at_token_limit(text: str, limit: int) -> List[str]:
     Used only when a sentence alone is longer than the chunk size — rare but
     possible in legal disclaimers and dense financial tables formatted as prose.
     """
-    tokens = _TOKENIZER.encode(text)
+    tokens = _TOKENIZER.encode(text, disallowed_special=())
     parts = []
     for start in range(0, len(tokens), limit):
         parts.append(_TOKENIZER.decode(tokens[start:start + limit]))
