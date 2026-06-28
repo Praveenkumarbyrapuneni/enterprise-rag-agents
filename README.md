@@ -197,6 +197,7 @@ On a developer laptop: `haiku`. On AWS with client financial data: `local`.
     "text": "...chunk content...",
     "metadata": {
         "file_name": "goldman_10k_2024.pdf",
+        "file_extension": ".pdf",
         "file_hash": "a3f9c2d8...",
         "page": 4,
         "chunk_index": 2,
@@ -210,7 +211,8 @@ On a developer laptop: `haiku`. On AWS with client financial data: `local`.
 
 Every chunk is permanently traceable to its source document, page, and position.
 The LLM can cite "Goldman Sachs 10-K 2024, page 4" because the metadata traveled
-with the chunk through every stage of the pipeline.
+with the chunk through every stage of the pipeline. The `file_extension` field
+enables direct Qdrant payload filtering by format without string-parsing filenames.
 
 ---
 
@@ -288,13 +290,14 @@ with the chunk through every stage of the pipeline.
 ## Status
 
 **Phase 1 — Foundation**
-- [x] Project structure, Docker Compose, environment setup
-- [x] Document parser — 9 formats, production edge cases handled
-- [ ] Chunker — sentence-aware fixed-size + hierarchical, content-aware router
-- [ ] Embedder — OpenAI text-embedding-3-large
-- [ ] Qdrant ingestion + similarity search
-- [ ] Milestone: end-to-end ingest and retrieve via Python script
+- [x] Project structure, Docker Compose, PostgreSQL + Redis + Qdrant stack
+- [x] Document parser — 9 formats, 17 production gaps fixed, full pipeline observability
+- [x] Chunker — sentence-aware fixed-size + hierarchical parent-child, content-aware router with 3 classifier modes, 7 production gaps found and fixed
+- [ ] Embedder — contextual retrieval (Anthropic) + OpenAI text-embedding-3-large, batched with retry
+- [ ] Qdrant uploader — idempotent writes, parent storage in PostgreSQL
+- [ ] Ingestion orchestrator — hash deduplication, Celery worker pool, dead letter queue
+- [ ] Milestone: end-to-end ingest and retrieve on real SEC EDGAR filings
 
-**Phase 2 — Agents** (Week 2)
-**Phase 3 — Evaluation** (Week 3)
-**Phase 4 — Production Deployment** (Week 4)
+**Phase 2 — Agents** (LangGraph, 4 agents, Cohere reranking, MMR)
+**Phase 3 — Evaluation** (RAGAS scoring, self-correcting retry loop, LangSmith tracing)
+**Phase 4 — AWS Migration** (Bedrock, RDS, SQS, ECS, Kinesis, Cognito auth)
