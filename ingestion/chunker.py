@@ -58,14 +58,32 @@ def _count_tokens(text: str) -> int:
     return len(_TOKENIZER.encode(text))
 
 
+_ABBREVS_RE = re.compile(
+    r"(?:^|\s)(Dr|Mr|Mrs|Ms|Prof|Sr|Jr|vs|Corp|Inc|Ltd|Co|Dept|U\.S|e\.g|i\.e|etc)\.",
+    re.IGNORECASE,
+)
+
+
 def _split_sentences(text: str) -> List[str]:
     """
     Split text into sentences on . ! ? boundaries.
-    Requires the character after punctuation to be whitespace + capital letter,
-    which prevents 'U.S.' or '$4.2B.' from triggering false splits.
+
+    Protects known abbreviations (Dr., Corp., U.S., etc.) from triggering
+    false splits. Without this, 'Dr. Smith reviewed revenue.' splits into
+    ['Dr.', 'Smith reviewed revenue.'] — breaking the sentence and producing
+    a 1-token chunk that carries no useful meaning.
+
+    Strategy: temporarily replace periods inside known abbreviations with a
+    placeholder, split on real sentence boundaries, then restore.
     """
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"\'\(])", text.strip())
-    return [s.strip() for s in parts if s.strip()]
+    if not text.strip():
+        return []
+
+    protected = _ABBREVS_RE.sub(
+        lambda m: m.group().replace(".", "\x00DOT\x00"), text.strip()
+    )
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"\'\(])", protected)
+    return [s.replace("\x00DOT\x00", ".").strip() for s in parts if s.strip()]
 
 
 def _split_at_token_limit(text: str, limit: int) -> List[str]:
@@ -183,22 +201,28 @@ def _is_financial(pages: List[Dict[str, Any]], file_name: str) -> bool:
     keyword → zero cost, regex-based, fast
     haiku   → Claude Haiku API, near-perfect accuracy (default)
     local   → local model via Ollama, full data privacy
+
+    Only samples the first 3 pages for classification — enough signal for any
+    financial document. Avoids building a 500K+ character string from a
+    500-page document when only the first 2000 characters are ever used.
     """
-    full_text = " ".join(p["text"] for p in pages)
+    sample_text = " ".join(
+        p.get("text", "") for p in pages[:3]
+    )
     mode = os.getenv("CHUNK_CLASSIFIER", "haiku").lower()
 
     if mode == "keyword":
-        return _keyword_score(full_text)
+        return _keyword_score(sample_text)
     elif mode == "haiku":
-        return _haiku_classify(full_text, file_name)
+        return _haiku_classify(sample_text, file_name)
     elif mode == "local":
-        return _local_classify(full_text, file_name)
+        return _local_classify(sample_text, file_name)
     else:
         logger.warning(
             f"[{file_name}] Unknown CHUNK_CLASSIFIER='{mode}'. "
             "Falling back to keyword scoring."
         )
-        return _keyword_score(full_text)
+        return _keyword_score(sample_text)
 
 
 # ── Sentence-aware chunking engine ────────────────────────────────────────────
@@ -216,13 +240,25 @@ def _sentences_with_pages(pages: List[Dict[str, Any]]) -> List[Tuple[str, int]]:
     """
     result: List[Tuple[str, int]] = []
     for page in pages:
-        for sentence in _split_sentences(page["text"]):
+        page_num = page.get("page", 0)
+        text = page.get("text")
+
+        if text is None:
+            logger.warning(f"Page {page_num} is missing 'text' field — skipped")
+            continue
+        if not isinstance(text, str):
+            logger.warning(
+                f"Page {page_num} 'text' is {type(text).__name__}, expected str — skipped"
+            )
+            continue
+
+        for sentence in _split_sentences(text):
             if _count_tokens(sentence) > _EMBEDDING_TOKEN_LIMIT:
                 # Last resort: split a monster sentence at token boundaries
                 for piece in _split_at_token_limit(sentence, 512):
-                    result.append((piece, page["page"]))
+                    result.append((piece, page_num))
             else:
-                result.append((sentence, page["page"]))
+                result.append((sentence, page_num))
     return result
 
 
@@ -296,6 +332,7 @@ def _strategy_fixed(
     groups = _build_chunk_groups(sentences, chunk_size=512, overlap_tokens=50)
     total = len(groups)
     ts = datetime.now(timezone.utc).isoformat()
+    file_ext = os.path.splitext(file_name)[1].lower()
 
     chunks = []
     for idx, group in enumerate(groups):
@@ -304,6 +341,7 @@ def _strategy_fixed(
             "text": text,
             "metadata": {
                 "file_name": file_name,
+                "file_extension": file_ext,
                 "file_hash": file_hash,
                 "page": page,
                 "chunk_index": idx,
@@ -345,6 +383,7 @@ def _strategy_hierarchical(
     """
     sentences = _sentences_with_pages(pages)
     ts = datetime.now(timezone.utc).isoformat()
+    file_ext = os.path.splitext(file_name)[1].lower()
 
     # Build parent groups — each group is the sentences that form one parent
     parent_groups = _build_chunk_groups(sentences, chunk_size=1024, overlap_tokens=0)
@@ -360,6 +399,7 @@ def _strategy_hierarchical(
             "id": parent_id,
             "text": parent_text,
             "file_name": file_name,
+            "file_extension": file_ext,
             "file_hash": file_hash,
             "page": parent_page,
             "timestamp": ts,
@@ -377,6 +417,7 @@ def _strategy_hierarchical(
                 "text": child_text,
                 "metadata": {
                     "file_name": file_name,
+                    "file_extension": file_ext,
                     "file_hash": file_hash,
                     "page": child_page,         # actual page, not parent's first page
                     "chunk_index": len(all_children),
@@ -424,6 +465,15 @@ def chunk_document(
         LOCAL_CLASSIFIER_MODEL: Ollama model name when using local mode
                                 (default: "gemma3:1b")
     """
+    if not file_name:
+        raise ValueError(
+            "file_name is required — chunks cannot be cited or traced without a source filename"
+        )
+    if not file_hash:
+        raise ValueError(
+            "file_hash is required — chunks cannot be deduplicated without a source hash"
+        )
+
     if not pages:
         logger.warning(
             f"[{file_name}] CHUNK WARNING: called with 0 pages — "
@@ -446,10 +496,16 @@ def chunk_document(
             else _strategy_fixed(pages, file_name, file_hash)
         )
 
-        logger.info(
-            f"[{file_name}] CHUNK SUCCESS: {len(result['chunks'])} chunks, "
-            f"{len(result['parents'])} parents — strategy={strategy}"
-        )
+        if not result["chunks"] and pages:
+            logger.warning(
+                f"[{file_name}] CHUNK WARNING: produced 0 chunks from {len(pages)} pages — "
+                "all pages may contain only whitespace or unparseable content"
+            )
+        else:
+            logger.info(
+                f"[{file_name}] CHUNK SUCCESS: {len(result['chunks'])} chunks, "
+                f"{len(result['parents'])} parents — strategy={strategy}"
+            )
         return result
 
     except Exception as e:
