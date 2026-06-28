@@ -43,6 +43,8 @@ import zipfile
 from email import policy
 from typing import Any, Dict, List, Tuple
 
+import threading
+
 import fitz  # PyMuPDF
 import pandas as pd
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -54,6 +56,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Vision client singleton — one client, reused across all image extractions.
+# Avoids creating a new connection pool per image (50 images = 50 pool setups
+# without this). Timeout kills hung Vision calls in 30s instead of 600s default.
+_vision_client    = None
+_vision_client_lock = threading.Lock()
+_VISION_TIMEOUT   = 30.0
+
+
+def _get_vision_client():
+    global _vision_client
+    if _vision_client is None:
+        with _vision_client_lock:
+            if _vision_client is None:
+                import anthropic
+                key = os.getenv("ANTHROPIC_API_KEY")
+                if not key:
+                    raise ValueError("ANTHROPIC_API_KEY not set — required for image parsing")
+                _vision_client = anthropic.Anthropic(api_key=key, timeout=_VISION_TIMEOUT)
+    return _vision_client
 
 # DOCX namespace constants for chart and text box extraction
 _DOCX_CHART_ELEM = "{http://schemas.openxmlformats.org/drawingml/2006/chart}chart"
@@ -69,14 +91,12 @@ def _extract_image_text(image_bytes: bytes, media_type: str = "image/png") -> st
 
     Claude understands layout — tables in images, charts, multi-column text —
     where traditional OCR (Tesseract) fails on complex financial documents.
+
+    Uses the module-level singleton client (_get_vision_client) so that one
+    connection pool is reused across all images in a document rather than
+    creating a new one per image. Times out in _VISION_TIMEOUT seconds.
     """
-    import anthropic
-
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not set — required for image parsing")
-
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _get_vision_client()
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -778,6 +798,7 @@ def _walk_html_email(
     node: Any,
     cid_images: Dict[str, Tuple[bytes, str]],
     parts: List[str],
+    file_path: str = "",
 ) -> None:
     """
     Walk HTML email body in DOM order, resolving cid: inline image references.
@@ -785,6 +806,10 @@ def _walk_html_email(
     Corporate HTML emails embed images as MIME parts referenced via
     cid: scheme (<img src="cid:uniqueid@domain">). This walker matches
     those references to the collected MIME parts and sends them to Vision.
+
+    file_path is passed for logging only — previously missing, which caused
+    NameError: 'file_path' is not defined when a cid image failed to extract.
+    The NameError would crash the entire email parse with a misleading message.
     """
     if isinstance(node, NavigableString):
         text = str(node).strip()
@@ -821,7 +846,7 @@ def _walk_html_email(
 
         else:
             for child in node.children:
-                _walk_html_email(child, cid_images, parts)
+                _walk_html_email(child, cid_images, parts, file_path)
             if node.name in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
                              "li", "tr", "br", "section", "article"):
                 parts.append("")
@@ -887,7 +912,7 @@ def parse_email(file_path: str) -> List[Dict[str, Any]]:
             for tag in soup(["script", "style"]):
                 tag.decompose()
             email_parts: List[str] = []
-            _walk_html_email(soup, cid_images, email_parts)
+            _walk_html_email(soup, cid_images, email_parts, file_path)
             text = "\n".join(
                 line for line in "\n".join(email_parts).splitlines() if line.strip()
             )

@@ -37,6 +37,7 @@ Returns:
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
@@ -44,6 +45,25 @@ from typing import Any, Dict, List, Tuple
 import tiktoken
 
 logger = logging.getLogger(__name__)
+
+# Haiku client singleton — classification is called once per document but
+# without a timeout a hung call blocks the Celery worker for up to 600s.
+_haiku_client      = None
+_haiku_client_lock = threading.Lock()
+_HAIKU_TIMEOUT     = 30.0
+
+
+def _get_haiku_client():
+    global _haiku_client
+    if _haiku_client is None:
+        with _haiku_client_lock:
+            if _haiku_client is None:
+                import anthropic
+                key = os.getenv("ANTHROPIC_API_KEY")
+                if not key:
+                    raise ValueError("ANTHROPIC_API_KEY not set")
+                _haiku_client = anthropic.Anthropic(api_key=key, timeout=_HAIKU_TIMEOUT)
+    return _haiku_client
 
 _TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
@@ -134,8 +154,7 @@ def _haiku_classify(text: str, file_name: str) -> bool:
     is never dropped due to a transient network or rate-limit error.
     """
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        client = _get_haiku_client()
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=5,

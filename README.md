@@ -291,9 +291,9 @@ enables direct Qdrant payload filtering by format without string-parsing filenam
 
 **Phase 1 — Foundation**
 - [x] Project structure, Docker Compose, PostgreSQL + Redis + Qdrant stack
-- [x] Document parser — 9 formats, 17 production gaps fixed, full pipeline observability
-- [x] Chunker — sentence-aware fixed-size + hierarchical parent-child, content-aware router with 3 classifier modes, 7 production gaps found and fixed
-- [ ] Embedder — contextual retrieval (Anthropic) + OpenAI text-embedding-3-large, batched with retry
+- [x] Document parser — 9 formats, 19 production gaps fixed (incl. Vision client singleton + timeout, email NameError), full pipeline observability
+- [x] Chunker — sentence-aware fixed + hierarchical parent-child, content-aware router, 8 production gaps fixed (incl. Haiku client singleton + timeout)
+- [x] Embedder — contextual retrieval (section-based, prompt caching), parallel Haiku enrichment (20 workers), OpenAI text-embedding-3-large, 10 production gaps fixed (incl. serial→parallel, silent corruption, network retry, thread safety)
 - [ ] Qdrant uploader — idempotent writes, parent storage in PostgreSQL
 - [ ] Ingestion orchestrator — hash deduplication, Celery worker pool, dead letter queue
 - [ ] Milestone: end-to-end ingest and retrieve on real SEC EDGAR filings
