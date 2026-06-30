@@ -81,7 +81,7 @@ python run_pipeline.py
 | **Parser** `ingestion/parser.py` | Extracts clean text from 9 formats | N-column reading order; scanned pages → Claude Vision; inline images in reading order; DOCX text boxes + embedded charts; email CID images; password-protected file detection |
 | **Chunker** `ingestion/chunker.py` | Routes to strategy by content, not file type | Fixed (512 tok, 50 overlap) for general docs; Hierarchical parent-child (1024/256 tok) for financial docs; Claude Haiku or local Ollama classifier |
 | **Embedder** `ingestion/embedder.py` | Context-enriches then embeds | Claude Haiku via Bedrock for contextual retrieval (20 parallel workers); Cohere Embed v3 via Bedrock (1024 dims); exponential backoff; data never leaves AWS VPC |
-| **Uploader** `ingestion/qdrant_uploader.py` | Idempotent write to Qdrant + PostgreSQL | hash + status in PostgreSQL prevents duplicate writes on retry; HNSW m=16/ef=200; scalar int8 quantization (4× memory, <1% recall loss); payload indexes before first write |
+| **Uploader** `ingestion/qdrant_uploader.py` | Idempotent write to Qdrant + PostgreSQL | hash + status in PostgreSQL prevents duplicate writes on retry; HNSW m=16/ef=200; TurboQuant 4-bit (8× memory reduction, ~1% recall loss); payload indexes before first write |
 
 **Two-level storage for financial documents:**
 - Child chunks (256 tokens) → Qdrant. Small = precise vector match.
@@ -108,7 +108,7 @@ python run_pipeline.py
 | LLM | Claude claude-sonnet-4-6 (Anthropic / Bedrock on AWS) |
 | Context enrichment | Claude Haiku 4.5 via Bedrock (data stays in VPC) |
 | Embeddings | Cohere Embed v3 via Bedrock (1024 dims) |
-| Vector store | Qdrant — HNSW + scalar quantization |
+| Vector store | Qdrant — HNSW + TurboQuant 4-bit (Google Research, ICLR 2026) |
 | Metadata + parents | PostgreSQL (Docker → RDS on AWS) |
 | Task queue | Celery + Redis (Docker → SQS on AWS) |
 | Agent orchestration | LangGraph |

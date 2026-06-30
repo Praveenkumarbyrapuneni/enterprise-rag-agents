@@ -185,14 +185,14 @@ def _is_already_complete(file_hash: str) -> bool:
     Args:
         file_hash: SHA-256 of the file.
     Returns:
-        True if status=complete exists in document_hashes.
+        True if status=complete exists in ingestion_status.
     """
     conn = None
     try:
         conn = _get_db_conn()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT status FROM document_hashes WHERE file_hash = %s",
+                "SELECT status FROM ingestion_status WHERE file_hash = %s",
                 (file_hash,),
             )
             row = cur.fetchone()

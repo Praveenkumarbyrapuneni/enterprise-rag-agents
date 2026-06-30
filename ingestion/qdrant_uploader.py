@@ -14,9 +14,9 @@ Idempotency guarantee:
 Qdrant collection (created once):
   - HNSW: m=16, ef_construction=200 — production-balanced recall vs. build time.
     Raise to m=24/ef=400 if recall benchmarks fall below 95% on financial queries.
-  - Scalar int8 quantization: 4x memory reduction, <1% recall loss on text.
+  - TurboQuant 4-bit quantization: 8x memory reduction, ~1% recall loss on text.
     always_ram=True keeps the quantized index hot for sub-millisecond lookup.
-    At query time, pass oversampling=2.0 + rescore=True to recover any recall gap.
+    Query vectors are scored at full precision (asymmetric) — no rescore needed.
   - Payload indexes created before first write — adding them post-hoc forces
     an HNSW rebuild which is expensive at 10M+ points.
 
@@ -57,9 +57,9 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType,
     PointStruct,
-    ScalarQuantization,
-    ScalarQuantizationConfig,
-    ScalarType,
+    TurboQuantBitSize,
+    TurboQuantization,
+    TurboQuantQuantizationConfig,
     VectorParams,
 )
 
@@ -179,11 +179,10 @@ def _ensure_collection() -> None:
                 ef_construct=_HNSW_EF,
                 on_disk=False,
             ),
-            quantization_config=ScalarQuantization(
-                scalar=ScalarQuantizationConfig(
-                    type=ScalarType.INT8,
+            quantization_config=TurboQuantization(
+                turbo=TurboQuantQuantizationConfig(
+                    bits=TurboQuantBitSize.BITS4,  # 8x compression, ~1% recall loss
                     always_ram=True,
-                    quantile=0.99,   # clip top-1% outliers before quantizing
                 )
             ),
         )
@@ -203,7 +202,7 @@ def _ensure_collection() -> None:
 
         logger.info(
             f"[uploader] Created Qdrant collection '{COLLECTION_NAME}' — "
-            f"HNSW(m={_HNSW_M}, ef={_HNSW_EF}) + scalar int8 quantization + "
+            f"HNSW(m={_HNSW_M}, ef={_HNSW_EF}) + TurboQuant 4-bit + "
             f"4 payload indexes"
         )
 
