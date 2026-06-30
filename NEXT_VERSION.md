@@ -293,6 +293,164 @@ Qdrant documentation provides the full tuning reference.
 
 ---
 
+## 8. AWS CloudWatch Logging (Phase B)
+
+**What it is:**
+
+Phase A (laptop) writes logs to `logs/rag.log` via file rotation.
+Phase B (AWS ECS) must ship logs to CloudWatch so they are searchable,
+alertable, and never lost when containers restart.
+
+**Why data must stay in AWS:**
+LangSmith (the obvious tracing alternative) is a SaaS — it sends queries,
+documents, and answers to LangChain's servers. For financial institution clients
+(Discover, JPMorgan), this violates data residency and compliance requirements.
+CloudWatch keeps everything inside the AWS VPC. Zero data leaves.
+
+**How to implement (zero code change):**
+
+The logger already handles this. In `agents/logger.py`, set `LOG_OUTPUT=cloudwatch`
+in the ECS task definition environment variables. The handler switches from file
+to stdout, and ECS ships stdout to CloudWatch automatically via the awslogs driver.
+
+Add this to every ECS task definition:
+```json
+"logConfiguration": {
+  "logDriver": "awslogs",
+  "options": {
+    "awslogs-group": "/rag-agents/production",
+    "awslogs-region": "us-east-1",
+    "awslogs-stream-prefix": "rag"
+  }
+}
+```
+
+Set up CloudWatch alarms for: ERROR log count > 10/minute, retriever latency
+p99 > 5s, evaluator faithfulness score < 0.85 sustained over 10 queries.
+
+**When to implement:**
+Phase B AWS migration. First thing before going live — without this you are
+blind to production failures.
+
+---
+
+## 9. Nova Pro vs Claude Sonnet Model Benchmark
+
+**What it is:**
+
+We currently use Claude Sonnet 4.6 for the synthesizer and evaluator agents.
+Amazon Nova Pro ($0.80/$3.20 per million tokens) is 4x cheaper than Sonnet
+($3/$15) and is positioned by AWS for complex agentic RAG tasks.
+
+Nova Pro scores 10-12 MMLU points lower than Sonnet. Whether this matters
+for our specific use case (financial document Q&A) is unknown until measured.
+
+**Why not switched yet:**
+For a financial institution client, a wrong answer about revenue, risk, or
+compliance can cause regulatory violations. We cannot guess — we must measure.
+
+**How to implement:**
+1. After Phase 2 agents are complete, run 50 representative financial queries
+2. Run through pipeline with Sonnet → record RAGAS faithfulness + relevance scores
+3. Swap synthesizer model to Nova Pro (one env var change: `BEDROCK_SYNTHESIS_MODEL`)
+4. Run the same 50 queries → record RAGAS scores
+5. If Nova Pro faithfulness ≥ 0.85 and relevance ≥ 0.80 → switch permanently
+
+Model env vars to make this a config change only (no code edits):
+- `BEDROCK_SYNTHESIS_MODEL` — synthesizer agent
+- `BEDROCK_EVAL_MODEL` — evaluator agent
+- `BEDROCK_HAIKU_MODEL_ID` — already exists for query analyzer + context enrichment
+
+**When to implement:**
+After evaluator agent is built and RAGAS scoring is working. Run the benchmark
+before going to a client — cost savings of 4x are significant at Discover scale
+(millions of queries per day).
+
+---
+
+## 10. OKF — Open Knowledge Format (Google, June 2026)
+
+**What it is:**
+
+OKF (Open Knowledge Format) is a Google Cloud specification published June 12, 2026.
+It stores curated, pre-verified facts as a directory of markdown files with YAML
+frontmatter. Unlike RAG (which re-derives knowledge from raw chunks every query),
+OKF stores facts that are ALWAYS true and never need to be retrieved from documents.
+
+For our financial RAG system, OKF would contain:
+- Financial term definitions (EPS, EBITDA, Tier 1 Capital, LIBOR, Basel III)
+- Company metadata (Apple's fiscal year ends September, Goldman Sachs ticker = GS)
+- Metric schemas (how to calculate revenue growth, net interest margin)
+- Regulatory definitions (SOX, PCI DSS, Dodd-Frank key terms)
+
+**How it plugs into our system:**
+
+OKF becomes a FIRST-CHECK in the query analyzer (Agent 1). Before the retriever
+searches Qdrant, the query analyzer checks if the question is answered by a verified
+OKF fact. If yes — return directly. No Qdrant search, no Claude synthesis, no
+hallucination risk.
+
+```
+User question
+     ↓
+[Query Analyzer]
+  → Check OKF first (instant, no vector search)
+  → If found: return verified fact directly
+  → If not found: proceed to Retriever → Synthesizer → Evaluator
+```
+
+**File structure:**
+```
+knowledge/
+├── terms/
+│   ├── eps.md           (type: definition, title: Earnings Per Share)
+│   ├── ebitda.md
+│   └── tier1_capital.md
+├── companies/
+│   ├── apple.md         (fiscal year ends September, ticker AAPL)
+│   └── goldman.md
+└── regulations/
+    ├── libor.md
+    └── basel3.md
+```
+
+**YAML frontmatter format (OKF v0.1 spec):**
+```yaml
+---
+type: definition
+title: Earnings Per Share (EPS)
+tags: [financial-metric, earnings, profitability]
+timestamp: 2026-06-30
+---
+EPS = Net Income / Weighted Average Shares Outstanding.
+Diluted EPS includes stock options and convertible securities.
+```
+
+**Why not built yet:**
+1. Content problem: the markdown files need to be written. Code to read them is 20
+   lines. The financial definitions take hours to write correctly.
+2. Can't test without a complete pipeline. The RAGAS evaluator will show us exactly
+   WHERE the system gives wrong answers. Build OKF to fix those specific gaps.
+3. OKF v0.1 is 18 days old (published June 12, 2026). No production financial system
+   is using it yet. Let the spec mature slightly before building on it.
+
+**When to implement:**
+After the full pipeline (Agents 1-4 + graph.py) is complete and running end-to-end.
+Run 50 test questions. Wherever the evaluator scores faithfulness < 0.85 on questions
+about known definitions or company metadata — those are the OKF files to write first.
+
+**Implementation steps (when ready):**
+1. Create `knowledge/` directory at project root
+2. Write markdown files for the 20 most common financial terms in your test queries
+3. Add `_check_okf(question)` function to query_analyzer.py (~20 lines):
+   - Embed the question
+   - Compare against pre-embedded OKF fact titles (cosine similarity)
+   - If score > 0.95 (high confidence it's a known fact) → return OKF content
+   - Else → proceed to Qdrant retrieval
+4. Pre-embed all OKF titles at startup (not per-query) — cache in memory
+
+---
+
 ## Summary Table
 
 | Upgrade | Trigger to Implement |
@@ -304,3 +462,171 @@ Qdrant documentation provides the full tuning reference.
 | Live transaction streaming | Phase B AWS deployment — after batch pipeline is stable |
 | Semantic chunking (optional) | Demand for processing single-topic academic / technical documents |
 | HNSW index tuning | RAGAS context recall drops below 0.80 at full 10M document scale |
+| CloudWatch logging | Phase B AWS migration — first thing before going live |
+| Nova Pro model benchmark | After evaluator is built and RAGAS scoring works end-to-end |
+| OKF (Google Open Knowledge Format) | After full pipeline works end-to-end + RAGAS shows gaps on known facts |
+| Redis → SQS | Phase B AWS migration |
+| PostgreSQL Docker → RDS | Phase B AWS migration |
+| Celery workers → ECS | Phase B AWS migration |
+| Qdrant Docker → Qdrant Cloud/EC2 | Phase B AWS migration |
+| Local files → S3 | Phase B AWS migration |
+| FastAPI local → ECS + API Gateway | Phase B AWS migration |
+| Batch pipeline → Kinesis streaming | Phase B, after batch pipeline stable on AWS |
+
+---
+
+## Phase B — Full AWS Migration Checklist
+
+Everything below is a config-only change. No Python code rewrites.
+The only things that change are environment variables and infrastructure.
+
+### Step 1 — Replace Redis with SQS
+**What:** Celery currently uses Redis as its message broker (task queue).
+On AWS, Redis → Amazon SQS. SQS is infinite scale, never loses a message,
+no single point of failure.
+
+**Code change:** Zero. One env var:
+```
+CELERY_BROKER_URL=sqs://  (currently redis://localhost:6379)
+```
+Install `celery[sqs]` — already planned in requirements. SQS queue names
+must match what Celery expects: `ingestion` and `dlq`.
+
+**SQS setup:**
+- Create two SQS queues: `rag-ingestion` and `rag-dlq`
+- Set visibility timeout = 10 minutes (longer than max task runtime)
+- Enable dead-letter queue on `rag-ingestion` → points to `rag-dlq`
+- IAM role on ECS task must have `sqs:SendMessage`, `sqs:ReceiveMessage`,
+  `sqs:DeleteMessage`, `sqs:GetQueueAttributes`
+
+---
+
+### Step 2 — Replace PostgreSQL Docker with RDS
+**What:** PostgreSQL currently runs in a Docker container on laptop.
+On AWS → Amazon RDS PostgreSQL (Multi-AZ for production, single-AZ for staging).
+
+**Code change:** Zero. One env var:
+```
+DATABASE_URL=postgresql://user:pass@rds-endpoint:5432/ragdb
+```
+RDS runs the same PostgreSQL version. Same schema. Same queries. Identical.
+
+**RDS setup:**
+- Engine: PostgreSQL 15+
+- Instance: db.t3.medium for staging, db.r6g.large for production
+- Multi-AZ: enabled (automatic failover)
+- Storage: 100GB gp3, autoscaling enabled
+- VPC: same VPC as ECS cluster — no public access
+- Security group: allow port 5432 from ECS security group only
+
+---
+
+### Step 3 — Replace Celery local workers with ECS
+**What:** Celery workers currently run as terminal processes on laptop.
+On AWS → ECS Fargate tasks (serverless containers, auto-scaling).
+
+**Code change:** Zero. The Celery worker command stays identical:
+```
+celery -A ingestion.orchestrator.celery_app worker --queues=ingestion
+```
+ECS runs this inside a container. Auto Scaling Group scales worker count
+based on SQS queue depth (CloudWatch metric: `ApproximateNumberOfMessagesVisible`).
+
+**ECS setup:**
+- Task definition: same Docker image as laptop
+- CPU: 2 vCPU, Memory: 4GB per worker task
+- Auto scaling: min 2 tasks, max 50 tasks
+- Scale out: queue depth > 100 messages → add workers
+- Scale in: queue depth = 0 for 5 minutes → remove workers
+- IAM task role: Bedrock, S3, SQS, RDS access (least privilege)
+- CloudWatch log group: `/rag-agents/workers`
+
+---
+
+### Step 4 — Replace Qdrant Docker with Qdrant Cloud or EC2 cluster
+**What:** Qdrant currently runs in a Docker container on laptop.
+On AWS → Qdrant Cloud (managed) or self-hosted Qdrant on EC2.
+
+**Code change:** Zero. Two env vars:
+```
+QDRANT_HOST=your-qdrant-cloud-endpoint
+QDRANT_PORT=6333
+QDRANT_API_KEY=your-key  (if using Qdrant Cloud)
+```
+
+**Two options:**
+- **Qdrant Cloud (recommended):** Managed service, automatic backups, scaling.
+  Runs inside AWS region — data stays within AWS. Cost: ~$0.05/GB/month.
+- **Self-hosted EC2:** More control, lower cost at large scale.
+  Use r6g.2xlarge (memory-optimised) — TurboQuant keeps vectors in RAM.
+  At 10M vectors × 1024 dims × 4-bit = ~5GB. r6g.large is sufficient.
+  Enable EBS snapshot backups daily.
+
+**Re-ingestion required:** Current collection has dense vectors only.
+Phase B is the right time to add sparse vectors for hybrid BM25 search
+(see item 4 in this file). Re-ingest with both dense + sparse vectors.
+Use Kinesis stream to re-ingest from S3 source documents.
+
+---
+
+### Step 5 — Replace local file storage with S3
+**What:** Source documents currently sit in the `tests/` folder on laptop.
+On AWS → S3 bucket. The ingestion pipeline reads from S3 instead of disk.
+
+**Code change:** Minimal. The orchestrator's `submit_document()` function
+currently takes a file path. On AWS it takes an S3 key instead.
+One function change in `ingestion/orchestrator.py` — the rest of the pipeline
+(parser, chunker, embedder, uploader) is unchanged.
+
+**S3 setup:**
+- Bucket: `rag-source-documents-{account-id}` (globally unique name)
+- Block all public access: enabled
+- Server-side encryption: SSE-KMS (not SSE-S3) — requirement for financial data
+- Versioning: enabled — never lose a source document
+- Lifecycle policy: move to S3 Glacier after 2 years (cost optimisation)
+- IAM: ECS task role has `s3:GetObject` on this bucket only
+
+---
+
+### Step 6 — Replace FastAPI local with ECS + API Gateway
+**What:** FastAPI currently runs locally (`uvicorn main:app`).
+On AWS → FastAPI in ECS container behind API Gateway (or ALB).
+
+**Code change:** Zero. The FastAPI app code is identical.
+Container runs `uvicorn agents.api:app --host 0.0.0.0 --port 8080`.
+
+**Setup:**
+- ECS service: 2 tasks minimum, behind Application Load Balancer
+- API Gateway: optional (adds auth, rate limiting, API keys per client)
+- HTTPS: ACM certificate on ALB — HTTP redirects to HTTPS
+- WAF: AWS WAF on API Gateway — blocks SQL injection, XSS, rate abuse
+- Target group health check: `GET /health` → 200
+
+---
+
+### Step 7 — Add Kinesis Streaming Pipeline
+**What:** Batch ingestion handles historical documents.
+Kinesis handles live transactions that must be searchable within seconds.
+
+See item 5 in this file for full details.
+Implement after batch pipeline is stable on AWS.
+
+---
+
+### Phase B — Migration Order (Do Not Skip Steps)
+
+```
+1. RDS first          → data layer must exist before workers start
+2. SQS second         → queue must exist before workers connect
+3. S3 third           → source documents uploaded before re-ingestion
+4. ECS workers fourth → connect to RDS + SQS + S3 + Bedrock
+5. Qdrant Cloud fifth → re-ingest all documents with dense + sparse vectors
+6. ECS API sixth      → connect to Qdrant + RDS, expose via ALB
+7. CloudWatch seventh → verify all logs flowing before going live
+8. Kinesis last       → only after batch pipeline proven stable
+```
+
+**The golden rule:** Each step is just changing env vars in the ECS task
+definition. The Python code never changes. If you find yourself editing
+Python files during Phase B migration, stop — something is wrong with
+the architecture decision made in Phase A.

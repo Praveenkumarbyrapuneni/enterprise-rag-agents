@@ -15,3 +15,9 @@ learnings/
 building_steps.md
 MEMORY.md
 CLAUDE.md
+
+# LangGraph Studio runtime cache
+.langgraph_api/
+
+# Pipeline diagram (generated, not source)
+rag_pipeline.png

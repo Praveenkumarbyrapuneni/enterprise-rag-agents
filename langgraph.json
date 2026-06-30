@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "rag_pipeline": "agents.graph:_graph"
+  },
+  "env": ".env"
+}

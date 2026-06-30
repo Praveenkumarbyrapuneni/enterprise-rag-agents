@@ -114,7 +114,8 @@ python run_pipeline.py
 | Agent orchestration | LangGraph |
 | Re-ranking | Cohere Rerank |
 | Evaluation | RAGAS |
-| Tracing | LangSmith |
+| Logging (Phase A) | File logs → logs/rag.log |
+| Logging (Phase B) | AWS CloudWatch (ECS ships stdout automatically) |
 | Safety | Guardrails AI (PII redaction, prompt injection) |
 | API | FastAPI |
 | Monitoring | Prometheus + Grafana |
@@ -158,8 +159,16 @@ QDRANT_BATCH_SIZE=256
 - [x] End-to-end test — 3 SEC filings (Apple, Goldman Sachs, JPMorgan), 3,233 vectors, zero duplicates
 - [x] AWS Bedrock migration — all AI calls route through Bedrock, data never leaves VPC
 
-**Phase 2 — Agents** (LangGraph, 4 agents, Cohere reranking, MMR)
+**Phase 2 — Agents** ✅ Complete
+- [x] `agents/state.py` — shared TypedDict state flowing through all agents
+- [x] `agents/logger.py` — file logging (Phase A), CloudWatch-ready (Phase B, zero code change)
+- [x] `agents/query_analyzer.py` — Claude Haiku classifies query type, splits multi-part questions, generates HyDE query (conceptual only — never for numerical to prevent hallucination)
+- [x] `agents/retriever.py` — dual-query dense search (question + HyDE), Cohere rerank, MMR deduplication, parent context expansion from PostgreSQL
+- [x] `agents/synthesizer.py` — lost-in-middle chunk reordering, grounded answer with inline citations, cannot-answer guard
+- [x] `agents/evaluator.py` — deterministic checks + Claude Haiku judge (custom, not RAGAS — RAGAS fails 83.5% on financial docs), IDK handling, confidence warning on max retries
+- [x] `agents/graph.py` — LangGraph pipeline: analyze → retrieve → synthesize → evaluate → retry loop (max 1 retry, dedicated increment_retry node)
+- [x] LangGraph Studio — visual pipeline dashboard via `langgraph dev`
 
-**Phase 3 — Evaluation** (RAGAS, self-correcting retry loop, LangSmith tracing)
+**Phase 3 — API + End-to-End Testing** (FastAPI wrapper, real query testing)
 
-**Phase 4 — AWS** (RDS, SQS, ECS, Kinesis, Cognito)
+**Phase 4 — AWS Migration** (RDS, SQS, ECS, CloudWatch — zero code changes, config only)
