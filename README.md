@@ -14,13 +14,20 @@ docker compose up -d
 
 # 2. Configure environment
 cp .env.example .env
-# Fill in ANTHROPIC_API_KEY and OPENAI_API_KEY
+# Fill in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run the demo (parses, chunks, embeds, uploads, queries)
-python demo.py --file path/to/document.pdf --query "What was Q3 revenue?"
+# 4. Start workers (3 separate terminals)
+celery -A ingestion.orchestrator.celery_app worker --queues=ingestion --loglevel=info
+celery -A ingestion.orchestrator.celery_app worker --queues=dlq --loglevel=info --hostname=dlq@%h
+celery -A ingestion.orchestrator.celery_app flower --port=5555
+
+# 5. Run the pipeline — edit file paths in run_pipeline.py then:
+python run_pipeline.py
+
+# Monitor at http://localhost:5555 (Flower) and http://localhost:6333/dashboard (Qdrant)
 ```
 
 ---
@@ -73,7 +80,7 @@ python demo.py --file path/to/document.pdf --query "What was Q3 revenue?"
 |---|---|---|
 | **Parser** `ingestion/parser.py` | Extracts clean text from 9 formats | N-column reading order; scanned pages → Claude Vision; inline images in reading order; DOCX text boxes + embedded charts; email CID images; password-protected file detection |
 | **Chunker** `ingestion/chunker.py` | Routes to strategy by content, not file type | Fixed (512 tok, 50 overlap) for general docs; Hierarchical parent-child (1024/256 tok) for financial docs; Claude Haiku or local Ollama classifier |
-| **Embedder** `ingestion/embedder.py` | Context-enriches then embeds | Anthropic contextual retrieval via Claude Haiku with prompt caching (~87% cost reduction); OpenAI text-embedding-3-large (3072 dims); 20 parallel Haiku workers; exponential backoff |
+| **Embedder** `ingestion/embedder.py` | Context-enriches then embeds | Claude Haiku via Bedrock for contextual retrieval (20 parallel workers); Cohere Embed v3 via Bedrock (1024 dims); exponential backoff; data never leaves AWS VPC |
 | **Uploader** `ingestion/qdrant_uploader.py` | Idempotent write to Qdrant + PostgreSQL | hash + status in PostgreSQL prevents duplicate writes on retry; HNSW m=16/ef=200; scalar int8 quantization (4× memory, <1% recall loss); payload indexes before first write |
 
 **Two-level storage for financial documents:**
@@ -99,8 +106,8 @@ python demo.py --file path/to/document.pdf --query "What was Q3 revenue?"
 | Layer | Technology |
 |---|---|
 | LLM | Claude claude-sonnet-4-6 (Anthropic / Bedrock on AWS) |
-| Context enrichment | Claude Haiku 4.5 with prompt caching |
-| Embeddings | OpenAI text-embedding-3-large (3072 dims) |
+| Context enrichment | Claude Haiku 4.5 via Bedrock (data stays in VPC) |
+| Embeddings | Cohere Embed v3 via Bedrock (1024 dims) |
 | Vector store | Qdrant — HNSW + scalar quantization |
 | Metadata + parents | PostgreSQL (Docker → RDS on AWS) |
 | Task queue | Celery + Redis (Docker → SQS on AWS) |
@@ -119,9 +126,11 @@ python demo.py --file path/to/document.pdf --query "What was Q3 revenue?"
 ## Environment Variables
 
 ```bash
-# Required
-ANTHROPIC_API_KEY=          # Haiku classifier + contextual enrichment
-OPENAI_API_KEY=             # text-embedding-3-large
+# AWS Bedrock — all AI calls route through here (data never leaves VPC)
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_REGION=us-east-1
+BEDROCK_HAIKU_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 
 # Infrastructure (defaults work with docker compose up -d)
 DATABASE_URL=postgresql://raguser:ragpassword@localhost:5432/ragdb
@@ -129,9 +138,9 @@ QDRANT_HOST=localhost
 QDRANT_PORT=6333
 
 # Tuning
-CHUNK_CLASSIFIER=haiku      # keyword | haiku | local
+CHUNK_CLASSIFIER=haiku      # keyword | haiku
 EMBEDDER_CONTEXT_MODE=haiku # haiku | skip
-QDRANT_COLLECTION_NAME=chunks
+QDRANT_COLLECTION_NAME=documents
 QDRANT_BATCH_SIZE=256
 ```
 
@@ -139,17 +148,18 @@ QDRANT_BATCH_SIZE=256
 
 ## Build Status
 
-**Phase 1 — Ingestion**
+**Phase 1 — Ingestion** ✅ Complete
 - [x] Infrastructure — Docker Compose (Qdrant + PostgreSQL + Redis)
 - [x] Parser — 9 formats, 19 production gaps fixed
 - [x] Chunker — fixed + hierarchical strategies, content-aware router, 8 gaps fixed
-- [x] Embedder — contextual retrieval, parallel enrichment, 10 gaps fixed
+- [x] Embedder — Bedrock Cohere v3 (1024 dims), contextual retrieval via Haiku, 10 gaps fixed
 - [x] Qdrant Uploader — idempotent writes, HNSW tuning, scalar quantization
-- [ ] Ingestion Orchestrator — Celery worker pool, dead letter queue
-- [ ] End-to-end test on SEC EDGAR 10-K filings
+- [x] Ingestion Orchestrator — Celery worker pool, hash gate, dead letter queue
+- [x] End-to-end test — 3 SEC filings (Apple, Goldman Sachs, JPMorgan), 3,233 vectors, zero duplicates
+- [x] AWS Bedrock migration — all AI calls route through Bedrock, data never leaves VPC
 
 **Phase 2 — Agents** (LangGraph, 4 agents, Cohere reranking, MMR)
 
 **Phase 3 — Evaluation** (RAGAS, self-correcting retry loop, LangSmith tracing)
 
-**Phase 4 — AWS** (Bedrock, RDS, SQS, ECS, Kinesis, Cognito)
+**Phase 4 — AWS** (RDS, SQS, ECS, Kinesis, Cognito)
