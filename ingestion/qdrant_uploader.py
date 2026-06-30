@@ -22,7 +22,7 @@ Qdrant collection (created once):
 
 Batch sizing:
   256 points per upsert (QDRANT_BATCH_SIZE). Balances throughput against memory
-  pressure for 3072-dim vectors. HPC benchmarks on 8M vectors found 32 points
+  pressure for 1024-dim vectors. HPC benchmarks on 8M vectors found 32 points
   optimal for single-threaded writes; 256 is safe for our Celery worker model.
 
 Entry point: upload_document(embedded_chunks, parents, file_name, file_hash)
@@ -68,7 +68,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "chunks")
-VECTOR_SIZE     = 3072                                    # text-embedding-3-large
+VECTOR_SIZE     = 1024                                    # cohere.embed-english-v3 (AWS Bedrock)
 BATCH_SIZE      = int(os.getenv("QDRANT_BATCH_SIZE", "256"))
 _MAX_RETRIES    = 5
 _HNSW_M         = 16
@@ -524,7 +524,7 @@ def query_similar(
     child slice that was searched.
 
     Args:
-        query_vector:      3072-float embedding of the user's question.
+        query_vector:      1024-float embedding of the user's question.
         top_k:             Number of results to return.
         file_name_filter:  If set, restrict search to chunks from this file.
 
@@ -623,7 +623,7 @@ if __name__ == "__main__":
     # 3. _build_points must produce correct point structure
     sample = [
         {
-            "vector": [0.1] * 3072,
+            "vector": [0.1] * 1024,
             "text": "Revenue declined 14% in Q3.",
             "metadata": {
                 "file_name": "test.pdf",
@@ -639,7 +639,7 @@ if __name__ == "__main__":
     ]
     points = _build_points(sample)
     assert len(points) == 1
-    assert len(points[0].vector) == 3072
+    assert len(points[0].vector) == 1024
     assert points[0].payload["text"] == "Revenue declined 14% in Q3."
     assert points[0].payload["strategy"] == "fixed"
     assert points[0].payload["file_hash"] == "abc123"

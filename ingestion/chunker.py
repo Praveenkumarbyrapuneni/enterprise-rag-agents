@@ -46,29 +46,30 @@ import tiktoken
 
 logger = logging.getLogger(__name__)
 
-# Haiku client singleton — classification is called once per document but
-# without a timeout a hung call blocks the Celery worker for up to 600s.
-_haiku_client      = None
-_haiku_client_lock = threading.Lock()
-_HAIKU_TIMEOUT     = 30.0
+# Bedrock client singleton — all AI calls route through AWS, data never leaves VPC.
+_bedrock_client      = None
+_bedrock_client_lock = threading.Lock()
+_HAIKU_MODEL_ID      = os.getenv(
+    "BEDROCK_HAIKU_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 
 
-def _get_haiku_client():
-    global _haiku_client
-    if _haiku_client is None:
-        with _haiku_client_lock:
-            if _haiku_client is None:
-                import anthropic
-                key = os.getenv("ANTHROPIC_API_KEY")
-                if not key:
-                    raise ValueError("ANTHROPIC_API_KEY not set")
-                _haiku_client = anthropic.Anthropic(api_key=key, timeout=_HAIKU_TIMEOUT)
-    return _haiku_client
+def _get_bedrock():
+    global _bedrock_client
+    if _bedrock_client is None:
+        with _bedrock_client_lock:
+            if _bedrock_client is None:
+                import boto3
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                )
+    return _bedrock_client
 
 _TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
-# Hard ceiling from OpenAI embedding model — no chunk may exceed this
-_EMBEDDING_TOKEN_LIMIT = 8191
+# Hard ceiling from Cohere Embed v3 on Bedrock — no chunk may exceed this
+_EMBEDDING_TOKEN_LIMIT = 512
 
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
@@ -149,18 +150,17 @@ def _keyword_score(text: str) -> bool:
 
 def _haiku_classify(text: str, file_name: str) -> bool:
     """
-    Ask Claude Haiku to classify the document.
-    Haiku understands context — distinguishes a passing mention of revenue
-    from a full earnings report. Cost: ~$0.00025 per 1K input tokens.
-    Falls back to keyword scoring on any API failure so the document
-    is never dropped due to a transient network or rate-limit error.
+    Ask Claude Haiku via AWS Bedrock to classify the document.
+    Data never leaves AWS — no external API calls.
+    Falls back to keyword scoring on any API failure.
     """
+    import json
     try:
-        client = _get_haiku_client()
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=5,
-            messages=[{
+        client = _get_bedrock()
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 5,
+            "messages": [{
                 "role": "user",
                 "content": (
                     "Is the following document a financial document containing "
@@ -170,8 +170,15 @@ def _haiku_classify(text: str, file_name: str) -> bool:
                     f"{text[:2000]}"
                 ),
             }],
+        })
+        response = client.invoke_model(
+            modelId=_HAIKU_MODEL_ID,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
         )
-        return response.content[0].text.strip().upper().startswith("YES")
+        result = json.loads(response["body"].read())
+        return result["content"][0]["text"].strip().upper().startswith("YES")
     except Exception as e:
         logger.warning(
             f"[{file_name}] Haiku classifier failed: {type(e).__name__}: {e}. "

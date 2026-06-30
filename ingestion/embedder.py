@@ -1,19 +1,21 @@
 """
 Embedder — converts chunker output into vectors ready for Qdrant.
 
+All AI calls route through AWS Bedrock — data never leaves the AWS VPC.
+
 Two-step process per chunk:
 
-  Step 1 — Contextual enrichment (Haiku, parallel):
+  Step 1 — Contextual enrichment (Claude Haiku via Bedrock, parallel):
     Up to _HAIKU_CONCURRENCY Haiku calls run simultaneously via ThreadPoolExecutor.
     Each call gets: document header (1K tokens) + the section the chunk belongs
     to (30K tokens). Returns 1-2 sentences of specific context.
-    Retries on Anthropic rate limits. Falls back to raw chunk text only after
+    Retries on Bedrock throttling. Falls back to raw chunk text only after
     all retries are exhausted.
 
-  Step 2 — Embedding (OpenAI):
-    text-embedding-3-large converts each enriched text to a 3072-dim vector.
-    Batched (100 per API call). Retries on rate limits, network errors, and
-    server errors with exponential backoff + jitter.
+  Step 2 — Embedding (Cohere Embed v3 via Bedrock):
+    cohere.embed-english-v3 converts each enriched text to a 1024-dim vector.
+    Batched (90 per API call — Cohere's max is 96). Retries on throttling,
+    network errors, and server errors with exponential backoff + jitter.
 
 Entry point: embed_chunks(chunks, document_text, file_name)
 
@@ -21,8 +23,8 @@ Returns one dict per chunk:
   {"vector": List[float], "text": str, "metadata": dict}
 
 Environment variables:
-  ANTHROPIC_API_KEY      — for Haiku context generation
-  OPENAI_API_KEY         — for text-embedding-3-large
+  AWS_REGION             — Bedrock region (default: us-east-1)
+  BEDROCK_HAIKU_MODEL_ID — Claude Haiku model ID on Bedrock
   EMBEDDER_CONTEXT_MODE  — "haiku" (default) | "skip" (no enrichment)
 """
 
@@ -41,12 +43,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_EMBED_MODEL         = "text-embedding-3-large"
-_EMBED_DIMS          = 3072
-_EMBED_TOKEN_LIMIT   = 8191          # OpenAI hard limit per input text
-_BATCH_SIZE          = 100           # Conservative — keeps retry cost low
+_EMBED_MODEL         = "cohere.embed-english-v3"          # Bedrock Cohere Embed v3
+_EMBED_DIMS          = 1024                               # Cohere v3 output dimensions
+_EMBED_TOKEN_LIMIT   = 512           # Cohere v3 hard limit per input text
+_BATCH_SIZE          = 90            # Cohere max is 96 — stay conservative
 _MAX_RETRIES         = 5
-_CONTEXT_MODEL       = "claude-haiku-4-5-20251001"
+_CONTEXT_MODEL       = os.getenv(
+    "BEDROCK_HAIKU_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 _CONTEXT_MAX_TOKENS  = 150           # 1-2 sentences is enough
 _SECTION_TOKENS      = 30_000        # ~60 pages per section sent to Haiku
 _HEADER_TOKENS       = 1_000         # first ~2 pages — always has company/date/doc type
@@ -55,48 +59,26 @@ _API_TIMEOUT         = 30.0          # seconds — hung API calls are killed at 
 
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
-# Gap 8 fix: double-checked locking prevents race conditions when multiple
-# threads initialise the singleton simultaneously.
-_openai_client    = None
-_anthropic_client = None
-_openai_lock      = threading.Lock()
-_anthropic_lock   = threading.Lock()
+# Double-checked locking prevents race conditions when multiple threads
+# initialise the singleton simultaneously.
+_bedrock_client = None
+_bedrock_lock   = threading.Lock()
 
 
-# ── Client helpers ────────────────────────────────────────────────────────────
+# ── Client helper ─────────────────────────────────────────────────────────────
 
 
-def _get_openai():
-    global _openai_client
-    if _openai_client is None:
-        with _openai_lock:
-            if _openai_client is None:          # re-check inside the lock
-                from openai import OpenAI
-                key = os.getenv("OPENAI_API_KEY")
-                if not key:
-                    raise ValueError(
-                        "OPENAI_API_KEY not set. Copy .env.example → .env and fill it in."
-                    )
-                # Gap 9 fix: explicit timeout so a hung API call fails in 30s,
-                # not the SDK default of 600s which blocks a Celery worker slot.
-                _openai_client = OpenAI(api_key=key, timeout=_API_TIMEOUT)
-    return _openai_client
-
-
-def _get_anthropic():
-    global _anthropic_client
-    if _anthropic_client is None:
-        with _anthropic_lock:
-            if _anthropic_client is None:       # re-check inside the lock
-                import anthropic
-                key = os.getenv("ANTHROPIC_API_KEY")
-                if not key:
-                    raise ValueError(
-                        "ANTHROPIC_API_KEY not set. Copy .env.example → .env and fill it in."
-                    )
-                # Gap 9 fix: same timeout as OpenAI client.
-                _anthropic_client = anthropic.Anthropic(api_key=key, timeout=_API_TIMEOUT)
-    return _anthropic_client
+def _get_bedrock():
+    global _bedrock_client
+    if _bedrock_client is None:
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                import boto3
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                )
+    return _bedrock_client
 
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
@@ -172,53 +154,53 @@ def _generate_context(
         Context sentence(s), or None if all retries failed or context was unusable.
         Caller falls back to raw chunk text when None is returned.
     """
-    import anthropic as _anthropic_mod
+    import json
+    from botocore.exceptions import ClientError
 
     delay = 1.0
     for attempt in range(_MAX_RETRIES):
         try:
-            client = _get_anthropic()
-            response = client.messages.create(
-                model=_CONTEXT_MODEL,
-                max_tokens=_CONTEXT_MAX_TOKENS,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"<document>\n{context_text}\n</document>\n\n",
-                                "cache_control": {"type": "ephemeral"},
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"<chunk>\n{chunk_text}\n</chunk>\n\n"
-                                    "In 1-2 sentences, describe what this chunk is about "
-                                    "in the context of the full document. Be specific: include "
-                                    "the company name, time period, and what the figures refer to "
-                                    "if present. Output only the description, no preamble."
-                                ),
-                            },
-                        ],
-                    }
-                ],
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": _CONTEXT_MAX_TOKENS,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"<document>\n{context_text}\n</document>\n\n",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"<chunk>\n{chunk_text}\n</chunk>\n\n"
+                                "In 1-2 sentences, describe what this chunk is about "
+                                "in the context of the full document. Be specific: include "
+                                "the company name, time period, and what the figures refer to "
+                                "if present. Output only the description, no preamble."
+                            ),
+                        },
+                    ],
+                }],
+            })
+            response = _get_bedrock().invoke_model(
+                modelId=_CONTEXT_MODEL,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
             )
+            result = json.loads(response["body"].read())
 
-            # Gap 2 fix: guard against empty content list before indexing.
-            # Haiku can return an empty content list on degenerate inputs.
-            if not response.content:
+            if not result.get("content"):
                 logger.warning(
-                    f"[{file_name}] Haiku returned empty content block on attempt {attempt + 1} — "
+                    f"[{file_name}] Haiku returned empty content on attempt {attempt + 1} — "
                     "falling back to raw chunk text"
                 )
                 return None
 
-            text = response.content[0].text.strip()
+            text = result["content"][0]["text"].strip()
 
-            # Gap 2 fix: discard trivially short responses. A context shorter than
-            # 10 characters ("OK.", "N/A", "") adds no useful information and
-            # introduces noise into the embedding.
             if len(text) <= 10:
                 logger.warning(
                     f"[{file_name}] Haiku context too short ({len(text)} chars) — "
@@ -228,23 +210,28 @@ def _generate_context(
 
             return text
 
-        except _anthropic_mod.RateLimitError as e:
-            # Gap 7 fix: rate limits are temporary — retry, don't silently give up.
-            # The old code fell back immediately, producing raw chunk text and
-            # silently degrading retrieval quality under any load spike.
-            if attempt == _MAX_RETRIES - 1:
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "ThrottlingException":
+                if attempt == _MAX_RETRIES - 1:
+                    logger.warning(
+                        f"[{file_name}] Bedrock throttling — all {_MAX_RETRIES} retries "
+                        "exhausted. Falling back to raw chunk text."
+                    )
+                    return None
+                wait = delay + random.uniform(0, 0.5 * delay)
                 logger.warning(
-                    f"[{file_name}] Anthropic rate limit — all {_MAX_RETRIES} retries "
-                    "exhausted. Falling back to raw chunk text."
+                    f"[{file_name}] Bedrock throttling, retry {attempt + 1}/{_MAX_RETRIES} "
+                    f"in {wait:.1f}s"
+                )
+                time.sleep(wait)
+                delay *= 2
+            else:
+                logger.warning(
+                    f"[{file_name}] Bedrock error {error_code}: {e}. "
+                    "Falling back to raw chunk text."
                 )
                 return None
-            wait = delay + random.uniform(0, 0.5 * delay)
-            logger.warning(
-                f"[{file_name}] Anthropic rate limit, retry {attempt + 1}/{_MAX_RETRIES} "
-                f"in {wait:.1f}s"
-            )
-            time.sleep(wait)
-            delay *= 2
 
         except Exception as e:
             logger.warning(
@@ -320,69 +307,58 @@ def _enrich_single(
 
 def _embed_batch_with_retry(texts: List[str], file_name: str) -> List[List[float]]:
     """
-    Call OpenAI embeddings API with exponential backoff.
+    Call Cohere Embed v3 via AWS Bedrock with exponential backoff.
 
-    Gap 4 fix: also retries on APIConnectionError and APITimeoutError (network-
-               level failures). The old code only retried RateLimitError, so a
-               single TCP timeout would crash the entire pipeline with no retry.
-    Gap 3 fix: sorts response by item.index before returning. OpenAI's contract
-               says results are ordered, but we verify rather than assume.
-    Gap 5 fix: raises RuntimeError explicitly if the loop somehow exits without
-               returning, instead of returning implicit None which causes a
-               confusing TypeError downstream.
+    Data never leaves AWS — all embedding calls route through Bedrock inside
+    the VPC. input_type="search_document" tells Cohere these are documents
+    being ingested (not queries), which improves retrieval accuracy.
 
     Args:
         texts:     List of enriched texts to embed (max _BATCH_SIZE items).
         file_name: For logging only.
 
     Returns:
-        List of 3072-dimensional float vectors, one per input text, in input order.
+        List of 1024-dimensional float vectors, one per input text, in input order.
 
     Raises:
-        openai.RateLimitError / APIConnectionError / APITimeoutError:
-            If all _MAX_RETRIES are exhausted.
-        openai.APIStatusError:
-            For non-retriable client errors (4xx).
-        RuntimeError:
-            If the retry loop exits without returning (programming error).
+        RuntimeError: If the retry loop exits without returning (programming error).
     """
-    import openai
+    import json
+    from botocore.exceptions import ClientError
+
+    _RETRIABLE = {"ThrottlingException", "ServiceUnavailableException", "InternalServerException"}
 
     delay = 1.0
     for attempt in range(_MAX_RETRIES):
         try:
-            response = _get_openai().embeddings.create(input=texts, model=_EMBED_MODEL)
-            # Gap 3 fix: sort by index — don't assume response order matches input order.
-            sorted_data = sorted(response.data, key=lambda item: item.index)
-            return [item.embedding for item in sorted_data]
-
-        except (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError) as e:
-            # Gap 4 fix: all three of these are transient — worth retrying.
-            if attempt == _MAX_RETRIES - 1:
-                logger.error(
-                    f"[{file_name}] {type(e).__name__} — "
-                    f"all {_MAX_RETRIES} retries exhausted: {e}"
-                )
-                raise
-            wait = delay + random.uniform(0, 0.5 * delay)
-            logger.warning(
-                f"[{file_name}] {type(e).__name__}, "
-                f"retry {attempt + 1}/{_MAX_RETRIES} in {wait:.1f}s"
+            # ponytail: Bedrock validates input length before Cohere sees it — 2048 char hard limit
+            body = json.dumps({
+                "texts": [t[:2048] for t in texts],
+                "input_type": "search_document",
+                "truncate": "END",
+            })
+            response = _get_bedrock().invoke_model(
+                modelId=_EMBED_MODEL,
+                body=body,
+                contentType="application/json",
+                accept="*/*",
             )
-            time.sleep(wait)
-            delay *= 2
+            result = json.loads(response["body"].read())
+            # Cohere returns embeddings in the same order as input — no sorting needed.
+            return result["embeddings"]
 
-        except openai.APIStatusError as e:
-            if e.status_code >= 500:
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code in _RETRIABLE:
                 if attempt == _MAX_RETRIES - 1:
                     logger.error(
-                        f"[{file_name}] OpenAI server error {e.status_code} — "
+                        f"[{file_name}] Bedrock {error_code} — "
                         f"all {_MAX_RETRIES} retries exhausted: {e}"
                     )
                     raise
                 wait = delay + random.uniform(0, 0.5 * delay)
                 logger.warning(
-                    f"[{file_name}] Server error {e.status_code}, "
+                    f"[{file_name}] Bedrock {error_code}, "
                     f"retry {attempt + 1}/{_MAX_RETRIES} in {wait:.1f}s"
                 )
                 time.sleep(wait)
@@ -390,13 +366,9 @@ def _embed_batch_with_retry(texts: List[str], file_name: str) -> List[List[float
             else:
                 raise
 
-    # Gap 5 fix: this line should never be reached. If it is, something changed
-    # in the exception handling above that created a silent no-return path.
-    # Raising here makes the failure explicit instead of returning None and
-    # producing a confusing TypeError ("NoneType is not iterable") downstream.
     raise RuntimeError(
         f"[{file_name}] _embed_batch_with_retry exited retry loop without returning "
-        "or raising — this is a programming error in the exception handlers above"
+        "or raising — programming error in exception handlers above"
     )
 
 
@@ -420,14 +392,14 @@ def embed_chunks(
     Returns:
         List of dicts, one per chunk, in the same order as the input:
         {
-            "vector":   List[float]  — 3072-dimensional embedding
+            "vector":   List[float]  — 1024-dimensional embedding (Cohere Embed v3)
             "text":     str          — enriched text that was actually embedded
             "metadata": dict         — unchanged from chunker output
         }
 
     Raises:
         ValueError:    If file_name is empty.
-        RuntimeError:  If OpenAI returns a different number of vectors than chunks
+        RuntimeError:  If Bedrock returns a different number of vectors than chunks
                        (Gap 1 fix — prevents silently storing mismatched data).
 
     Environment variables:
@@ -536,7 +508,7 @@ def embed_chunks(
 
     logger.info(
         f"[{file_name}] EMBED SUCCESS: {len(results)} vectors "
-        f"dims={_EMBED_DIMS} context_mode={context_mode}"
+        f"dims={_EMBED_DIMS} model={_EMBED_MODEL} context_mode={context_mode}"
     )
     return results
 
@@ -574,9 +546,8 @@ if __name__ == "__main__":
     assert isinstance(secs, list) and len(secs) >= 1
     assert all(isinstance(s, str) for s in secs)
 
-    # Gap 8 fix check: lock objects must exist and be the right type
-    assert isinstance(_openai_lock, type(threading.Lock()))
-    assert isinstance(_anthropic_lock, type(threading.Lock()))
+    # Lock object must exist and be the right type
+    assert isinstance(_bedrock_lock, type(threading.Lock()))
 
     # Gap 2 fix check: _enrich_single with empty chunk text returns empty
     result_idx, result_text = _enrich_single(0, {"text": "", "metadata": {}}, "", "test.pdf")
