@@ -132,6 +132,27 @@ The warning is always logged — the failure is visible in CloudWatch. It is
 never swallowed silently. The difference between this and silent failure:
 silent failure hides the problem; this surfaces it while keeping the system alive.
 
+### HyDE Minimum Length — Discard Useless Hypotheses
+
+```python
+_MIN_HYDE_LEN = 20
+
+if hyde_applicable and len(hyde_query) < _MIN_HYDE_LEN:
+    logger.warning("[analyzer] HyDE query too short — discarding")
+    hyde_query = ""
+    hyde_applicable = False
+```
+
+When Haiku is asked to generate a hypothetical answer for HyDE, it occasionally
+returns a single word or a very short phrase — a signal that the model couldn't
+generate a useful hypothesis for this particular question.
+
+Embedding a 5-character hypothesis produces a near-meaningless vector that
+retrieves random chunks — worse than embedding the original question directly.
+
+The 20-character minimum discards these degenerate cases. The system falls
+back to direct question embedding, which is the safer path when HyDE fails.
+
 ### sql and hybrid Query Types
 
 Standard RAG systems treat every question as a document retrieval problem.
@@ -329,6 +350,27 @@ Three specific hallucination patterns were identified in financial document QA
 The synthesizer prompt explicitly forbids: paraphrasing numbers, rounding,
 using approximate language, and omitting time periods from financial figures.
 
+### Chunk Truncation at 3,000 Characters in Synthesizer Prompt
+
+```python
+_MAX_CHUNK_LEN = 3000
+
+if len(text) > _MAX_CHUNK_LEN:
+    text = text[:_MAX_CHUNK_LEN] + "... [truncated]"
+```
+
+Parent chunks can be up to 1,024 tokens (~4,000 characters). With 6 parent
+chunks, the synthesizer prompt reaches ~24,000 characters before the question
+is added — approaching Claude's optimal context window for single-call synthesis.
+
+3,000 characters per chunk keeps the total prompt manageable while retaining
+the most important content. Parent chunks front-load their key information
+(the parent was built from top-to-bottom reading order), so truncation at
+the tail rarely removes critical information.
+
+The `"... [truncated]"` suffix signals to Claude that the chunk was cut. Without
+it, Claude might cite a claim from text that doesn't exist in the truncated chunk.
+
 ### SQL Path: No Claude Call
 
 For `data_source=sql` queries, the synthesizer formats the database result
@@ -368,6 +410,45 @@ Deterministic checks run before the LLM judge to avoid unnecessary Bedrock calls
 - Answer with no chunks → 0.0/0.0 (synthesizer answered from memory — not permitted)
 
 Only answers that pass deterministic checks reach the Haiku judge.
+
+### _safe_score — LLM Scores Clamped to [0.0, 1.0]
+
+```python
+def _safe_score(value, default: float = 0.7) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+```
+
+The Haiku judge returns scores as JSON floats. LLMs occasionally return
+values outside the expected range — `1.5`, `-0.2`, `"high"`, or `None`.
+
+Without clamping: a faithfulness score of `1.5` passes the threshold check
+(`1.5 >= 0.85`) correctly but a score of `-0.2` would always fail even
+for perfect answers, causing infinite retries that exhaust the max retry
+limit on every query.
+
+`_safe_score` clamps to `[0.0, 1.0]` and returns `0.7` (borderline, triggers
+retry) for any non-numeric value. The retry is the conservative safe action —
+it never passes a bad answer and never permanently breaks on bad LLM output.
+
+### Evaluator Judge Prompt Truncated at 600 Characters Per Chunk
+
+```python
+text = (c.get("text") or "").strip()[:600]
+```
+
+The evaluator's Haiku judge receives the question, the answer, and all retrieved
+chunks. Parent chunks can be up to 3,000 characters each. With 6 chunks, the
+judge prompt reaches ~20,000 characters before the question and answer are added.
+
+Haiku at 256 max output tokens only needs to read enough of each chunk to verify
+whether the answer's claims are supported. 600 characters per chunk (roughly
+one substantial paragraph) is sufficient for faithfulness evaluation.
+
+Truncating at 600 characters keeps the judge prompt under ~5,000 characters
+total — fast, cheap, and within Haiku's effective context window for this task.
 
 ### Conservative Fallback When Judge Fails
 
@@ -508,6 +589,28 @@ The handler logs the full exception internally (visible in CloudWatch) and
 returns only a generic message to the caller. The engineer gets the debug
 information; the attacker gets nothing.
 
+### Retry-After Header on 429 Responses
+
+```python
+raise HTTPException(
+    status_code=429,
+    detail=f"Rate limit exceeded. Max {_RATE_LIMIT} requests per minute.",
+    headers={"Retry-After": str(_RATE_WINDOW_S)},
+)
+```
+
+A 429 response without `Retry-After` forces the client to guess when to retry.
+Aggressive clients retry immediately and receive another 429, burning request
+slots and adding noise to logs.
+
+`Retry-After: 60` tells the client exactly how long to wait. Well-behaved HTTP
+clients (and any SDK built on top of them) honour this header automatically.
+The server's rate limit window is respected without the client needing custom
+backoff logic.
+
+This is standard HTTP protocol (RFC 6585). Omitting it is technically correct
+but operationally careless.
+
 ### Sliding Window Rate Limiting — Per API Key
 
 ```python
@@ -536,6 +639,29 @@ Note: this is in-memory per-instance. Phase B replaces it with Redis-backed
 rate limiting shared across all ECS instances.
 
 ## DB Lookup
+
+### _ROW_LIMIT = 50 — Hard Cap on All DB Queries
+
+```python
+_ROW_LIMIT = 50
+rows = cur.fetchmany(_ROW_LIMIT)
+```
+
+Without a row cap, a `SELECT * FROM transactions WHERE tenant_id=%s` query
+on a customer with years of transaction history returns thousands of rows.
+All of them get sent through the synthesizer prompt — a prompt that could
+reach hundreds of thousands of tokens.
+
+The 50-row hard cap applies at the database layer (`fetchmany`), not just at
+the intent parameter layer. Even if Claude requests 200 recent transactions,
+the database never returns more than 50. This prevents:
+- Accidental data dumps to the caller
+- Prompt overflow in the synthesizer
+- Excessive data exposure in a single API response
+
+50 rows covers every practical use case: nobody needs 50 transactions listed
+in a single answer. If they do, that is a reporting query that belongs in a
+dedicated reporting system, not a conversational RAG pipeline.
 
 ### Template-Based SQL, Not Raw Text2SQL
 

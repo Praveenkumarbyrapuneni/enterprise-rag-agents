@@ -7,6 +7,50 @@ including production issues discovered and how they were resolved.
 
 ## Parser
 
+### TIFF Multi-Frame via EOFError Loop
+
+```python
+while True:
+    try:
+        img.seek(frame)
+        img.convert("RGB").save(buf, format="PNG")
+        ...
+        frame += 1
+    except EOFError:
+        break
+```
+
+TIFF files can contain multiple frames (pages) in a single file — a common
+pattern when a document scanner batches multiple pages into one file. Pillow's
+API does not expose a frame count property. The only way to iterate frames
+is to seek until `EOFError` is raised.
+
+Claude Vision does not accept TIFF natively. Each frame is converted to PNG
+via Pillow's `convert("RGB")` before being sent to Vision. RGB conversion
+handles grayscale and palette-mode TIFFs that would otherwise produce incorrect
+output in the PNG conversion.
+
+### Parent UUID Type Mismatch — Production Bug Fixed
+
+```python
+# Original — fails with: operator does not exist: uuid = text
+WHERE parent_id = ANY(%s)
+
+# Fixed
+WHERE parent_id = ANY(%s::uuid[])
+```
+
+Parent IDs are stored as PostgreSQL `UUID` type. When psycopg2 passes a Python
+list of strings, PostgreSQL cannot compare `uuid = text` without an explicit
+cast. The query fails with an operator error.
+
+This bug only surfaces when parent chunks are actually fetched — it was invisible
+during Phase 1 testing because the retriever's parent fetch was failing silently
+and falling back to child text. Found and fixed during Phase 3 integration testing.
+
+`::uuid[]` casts the text array to UUID array before the comparison. The fix
+is 8 characters and prevents the silent fallback from masking the error.
+
 ### 9-Format Coverage Including TIFF
 
 Financial institutions handle more than PDFs. SEC filings arrive as HTML, audit
@@ -511,6 +555,64 @@ from documented limits by a small margin. A batch of exactly 96 at peak load
 has been observed to fail with a limit error that a batch of 90 never triggers.
 Conservative headroom is cheaper than debugging an intermittent batch failure
 at 3am.
+
+### Prompt Cache Sections — Shared Cache Hits Across Chunks
+
+```python
+_SECTION_TOKENS = 30_000   # ~60 pages per section sent to Haiku
+"cache_control": {"type": "ephemeral"}   # on the document context block
+```
+
+Contextual enrichment sends `document_header + section_text + chunk` to Haiku
+for every chunk. Without caching, 238 chunks in Apple's 10-K means 238 separate
+full-document context payloads sent to the API — 238 times the same 30K tokens
+of document context are transmitted and billed.
+
+Anthropic's prompt caching (`cache_control: ephemeral`) caches the input prefix
+for up to 5 minutes. All chunks within the same 30K-token section (roughly 60
+pages) share a single cache hit. The first chunk in the section pays full price.
+Every subsequent chunk in the same section costs ~90% less.
+
+At 1,000 chunks per document, this reduces contextual enrichment cost by ~85%.
+The section size of 30K tokens was chosen to maximize cache hit rate while
+keeping the context relevant to the chunk being enriched.
+
+### Lazy Imports Inside Celery Task — Submit Process Stays Lightweight
+
+```python
+# ponytail: lazy imports inside the task
+def ingest_document(self, file_path, file_hash):
+    from ingestion.parser import parse_document
+    from ingestion.embedder import embed_chunks
+    ...
+```
+
+Parser, embedder, and Qdrant uploader import heavy dependencies at module
+level: PyMuPDF, pandas, boto3, qdrant-client, tiktoken. If these were imported
+at the top of orchestrator.py, the `submit_document()` process (which just
+needs to hash a file and enqueue a task) would load all of them every time.
+
+Lazy imports: the submit process loads only `psycopg2` and `celery`. The
+heavy dependencies are loaded only inside the worker that actually runs
+the ingestion. Workers take slightly longer to start the first task but
+that startup cost is amortized across thousands of documents.
+
+### Queue Separation — Ingestion vs DLQ Workers
+
+```python
+task_routes={"ingestion.orchestrator.ingest_document": {"queue": "ingestion"}}
+```
+
+Two separate queues run two separate worker pools:
+- `ingestion` queue: normal ingestion workers, sized for throughput
+- `dlq` queue: dead letter workers, sized for monitoring and alerting
+
+Without this separation, a flood of failing documents fills the same queue as
+healthy ones. DLQ processing competes with active ingestion for worker slots.
+
+With separation, a surge of failures goes to the DLQ queue without touching
+ingestion throughput. The DLQ worker can be configured with lower concurrency
+and higher alerting — its job is visibility, not speed.
 
 ### Contextual Enrichment Before Embedding
 
