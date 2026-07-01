@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 import jwt
 import psycopg2
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from agents.logger import get_logger
@@ -106,6 +106,10 @@ class TokenResponse(BaseModel):
 
 # ── Password helpers ──────────────────────────────────────────────────────────
 
+# Dummy hash used when username not found — ensures constant-time response
+# regardless of whether the user exists, preventing username enumeration via timing.
+_DUMMY_HASH = bcrypt.hashpw(b"dummy", bcrypt.gensalt()).decode()
+
 def _hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -190,13 +194,20 @@ def register(req: RegisterRequest):
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
     """
     Authenticate and return a JWT.
 
     The token embeds tenant_id and customer_id — callers use it on /query
     without passing those fields manually.
+
+    Rate-limited per IP: 5 attempts/minute — prevents brute-force attacks.
     """
+    # Rate limit by IP so unauthenticated brute-force is blocked before DB hit.
+    client_ip = request.client.host if request.client else "unknown"
+    from api.main import _check_rate_limit, _LOGIN_RATE_LIMIT
+    _check_rate_limit(f"login:{client_ip}", _LOGIN_RATE_LIMIT)
+
     conn = _pg()
     try:
         with conn.cursor() as cur:
@@ -209,8 +220,12 @@ def login(req: LoginRequest):
     finally:
         conn.close()
 
-    # Same error for wrong username or wrong password — no user enumeration
-    if not row or not _verify_password(req.password, row[1]):
+    # Always run bcrypt.checkpw — even when the user doesn't exist.
+    # Without this, "user not found" returns faster than "wrong password"
+    # because the hash step is skipped, leaking valid usernames via timing.
+    stored_hash = row[1] if row else _DUMMY_HASH
+    password_ok = _verify_password(req.password, stored_hash)
+    if not row or not password_ok:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
     user_id, _, tenant_id, customer_id = row

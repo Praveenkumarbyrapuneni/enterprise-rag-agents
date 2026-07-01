@@ -77,16 +77,20 @@ _WARNING       = (
     "the source documents. Please verify key figures manually before acting on them."
 )
 
+import threading as _threading
 _bedrock_client: Optional[object] = None
+_bedrock_lock = _threading.Lock()
 
 
 def _get_bedrock():
     global _bedrock_client
     if _bedrock_client is None:
-        _bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-        )
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                )
     return _bedrock_client
 
 

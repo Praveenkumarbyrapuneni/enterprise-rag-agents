@@ -28,6 +28,28 @@ CREATE TABLE IF NOT EXISTS tenant_registry (
 CREATE INDEX IF NOT EXISTS idx_tenant_registry_tenant_id
     ON tenant_registry (tenant_id);
 
+-- Immutable query audit log — required for SEC/FINRA compliance.
+-- Every AI response must log: what was asked, what data was used, what was returned.
+-- Never delete rows from this table. Regulatory retention minimum is 7 years.
+CREATE TABLE IF NOT EXISTS query_audit_log (
+    id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       TEXT         NOT NULL,
+    customer_id     TEXT         NOT NULL,
+    question        TEXT         NOT NULL,
+    query_type      TEXT,
+    data_source     TEXT,
+    answer          TEXT,
+    sources         JSONB        NOT NULL DEFAULT '[]',
+    faithfulness    NUMERIC(4,3),
+    relevance       NUMERIC(4,3),
+    latency_ms      NUMERIC(10,2),
+    model_id        TEXT,
+    error           TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_query_audit_tenant_created
+    ON query_audit_log (tenant_id, created_at DESC);
+
 -- Users: one row per login. tenant_id links them to their company's data.
 CREATE TABLE IF NOT EXISTS users (
     user_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),

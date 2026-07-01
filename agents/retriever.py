@@ -66,28 +66,35 @@ _RERANK_MODEL   = "rerank-english-v3.0"
 _COLLECTION     = os.getenv("QDRANT_COLLECTION_NAME", "documents")
 
 # Process-level singletons — one client per worker, not per request
+import threading as _threading
 _bedrock_client: Optional[object] = None
 _qdrant_client:  Optional[QdrantClient] = None
+_bedrock_lock = _threading.Lock()
+_qdrant_lock  = _threading.Lock()
 
 
 def _get_bedrock():
     global _bedrock_client
     if _bedrock_client is None:
-        _bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-        )
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                )
     return _bedrock_client
 
 
 def _get_qdrant() -> QdrantClient:
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = QdrantClient(
-            host=os.getenv("QDRANT_HOST", "localhost"),
-            port=int(os.getenv("QDRANT_PORT", "6333")),
-            timeout=30.0,
-        )
+        with _qdrant_lock:
+            if _qdrant_client is None:
+                _qdrant_client = QdrantClient(
+                    host=os.getenv("QDRANT_HOST", "localhost"),
+                    port=int(os.getenv("QDRANT_PORT", "6333")),
+                    timeout=30.0,
+                )
     return _qdrant_client
 
 

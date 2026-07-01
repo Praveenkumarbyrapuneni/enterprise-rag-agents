@@ -127,6 +127,71 @@ where they connect from.
 Phase B: replace in-memory `deque` with Redis-backed sliding window for
 multi-instance ECS deployment where in-process state is not shared.
 
+### Compliance Audit Log — Every Query Logged for SEC/FINRA Retention
+
+```python
+def _write_audit_log(tenant_id, customer_id, question, result, latency_ms):
+    INSERT INTO query_audit_log (tenant_id, customer_id, question, query_type,
+        data_source, answer, sources, faithfulness, relevance, latency_ms, error)
+    VALUES (...)
+```
+
+The SEC fined 16 firms $81M in February 2024 for AI communication recordkeeping
+failures. FINRA's 2025 oversight report classifies AI-generated responses to customers
+as business communications subject to 7-year retention requirements.
+
+Every `/query` call writes to `query_audit_log` before returning. The write is
+non-fatal — a log failure never breaks the response to the caller. The table is
+append-only by convention; for full regulatory compliance, enforce immutability
+at the database level (row-level triggers or S3 Object Lock on exports).
+
+### Explicit max_tokens on All Bedrock Calls — Prevents 100x Quota Burn
+
+```python
+_MAX_TOKENS = 1024   # synthesizer
+_MAX_TOKENS = 256    # evaluator, db_lookup
+_MAX_TOKENS = 512    # query_analyzer
+```
+
+Bedrock pre-allocates quota based on `max_tokens` BEFORE the request is processed.
+Claude Sonnet 4 defaults to 64,000 if not set. One unset request burns the same
+TPM quota as 64 requests capped at 1,000 tokens.
+
+Additionally, output tokens carry a 5x TPM multiplier on Claude Sonnet 4+. A
+1,000-token response consumes 5,000 TPM. This is the root cause of the daily quota
+throttle observed on 2026-06-30 — the first ingestion run without explicit `max_tokens`
+burned through the day's allocation in under 20 minutes.
+
+All Bedrock calls in this codebase use explicit `max_tokens`. Never remove or
+omit this parameter.
+
+### Thread-Safe Boto3 Singleton Creation — Double-Checked Locking
+
+```python
+_bedrock_lock = threading.Lock()
+
+def _get_bedrock():
+    global _bedrock_client
+    if _bedrock_client is None:
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                _bedrock_client = boto3.client(...)
+    return _bedrock_client
+```
+
+Without the lock, two concurrent requests hitting `_get_bedrock()` simultaneously
+both see `_bedrock_client is None` and both create a client. The second assignment
+overwrites the first, leaking a connection. Under FastAPI's async + thread pool model,
+this race is likely on startup when many requests arrive before the first Bedrock call
+completes.
+
+Double-checked locking: the outer `if` avoids acquiring the lock on every call (fast
+path after initialization). The inner `if` ensures only one thread creates the client
+even when multiple threads pass the outer check simultaneously.
+
+Applied to: `retriever.py`, `synthesizer.py`, `evaluator.py`, `query_analyzer.py`.
+The embedder already had this pattern from Phase 1.
+
 ---
 
 ## Logger

@@ -57,16 +57,20 @@ _TIMEOUT_S     = 15      # Haiku is fast; >15s = something wrong upstream
 _MAX_SUB_Q     = 4       # research: >4 sub-questions degrades retrieval
 _MIN_HYDE_LEN  = 20      # shorter than this = LLM gave up; discard
 
+import threading as _threading
 _bedrock_client: Optional[object] = None
+_bedrock_lock = _threading.Lock()
 
 
 def _get_bedrock():
     global _bedrock_client
     if _bedrock_client is None:
-        _bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-        )
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                )
     return _bedrock_client
 
 

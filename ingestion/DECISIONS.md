@@ -5,6 +5,61 @@ including production issues discovered and how they were resolved.
 
 ---
 
+## Corpus Security
+
+### Authenticated Ingest Only — BadRAG Corpus Poisoning Prevention
+
+BadRAG (published ICLR 2025) demonstrated 98.2% attack success rate at just 0.04%
+corpus contamination. Adversarially-optimized documents are crafted to maximize
+cosine similarity with targeted queries while injecting malicious content into LLM
+responses. The attack is invisible to standard monitoring.
+
+The only effective prevention at the ingestion layer:
+
+1. **Authenticated ingest only** — no anonymous document uploads. Every document
+   must arrive through an authenticated path with a known `tenant_id` and `ingested_by`.
+2. **Source provenance in payload** — every Qdrant point includes `file_name`,
+   `file_hash`, and `tenant_id`. Future: add `ingested_by` and `source_url`.
+3. **Retrieval frequency monitoring** — a legitimate domain document should not be
+   retrieved for 90%+ of diverse queries. If it is, it's likely poisoned.
+
+The current `reingest_with_tenants.py` script reads from `tests/` (local filesystem)
+with a hardcoded `TENANT_MAP`. This is the Phase A authenticated path — the operator
+controls exactly which files enter the corpus. Phase B equivalent: S3 pre-signed URLs
+with tenant-scoped bucket policies.
+
+### HNSW Bulk Ingest Optimization — Disable Indexing During Heavy Writes
+
+HNSW graph construction is O(n log n) per insert at high segment counts. Re-ingesting
+3,000+ chunks with HNSW enabled causes CPU spikes and worker timeouts at scale.
+
+Current Phase A behavior: acceptable at 3,233 chunks. HNSW updates are fast enough.
+
+At 10M+ chunks (Phase B), the correct approach is:
+
+```python
+# Step 1: Disable HNSW construction before bulk ingest
+client.update_collection(
+    COLLECTION_NAME,
+    optimizer_config=OptimizersConfigDiff(indexing_threshold=0)
+)
+
+# Step 2: Run all upserts (fast — no graph updates during write)
+_upload_to_qdrant(embedded_chunks, file_name, tenant_id)
+
+# Step 3: Re-enable HNSW — Qdrant rebuilds graph in background
+client.update_collection(
+    COLLECTION_NAME,
+    optimizer_config=OptimizersConfigDiff(indexing_threshold=20000)
+)
+```
+
+This reduces bulk ingest time by 60-80% on large corpora. The search index is unavailable
+during the background rebuild (~minutes for 10M vectors), so schedule bulk ingests during
+maintenance windows.
+
+---
+
 ## Parser
 
 ### TIFF Multi-Frame via EOFError Loop

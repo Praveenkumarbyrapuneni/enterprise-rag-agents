@@ -74,31 +74,34 @@ def _get_current_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) ->
     return decode_token(creds.credentials)
 
 
-# ── Rate limiting (in-memory sliding window, keyed on user_id) ───────────────
+# ── Rate limiting (in-memory sliding window) ─────────────────────────────────
+# Keyed on user_id for /query, on username/IP for /auth/login (brute-force protection).
+# Phase B: replace with Redis-backed window for multi-instance ECS deployment.
 
-_RATE_WINDOW_S: int = 60
-_RATE_LIMIT:    int = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
+_RATE_WINDOW_S:    int = 60
+_RATE_LIMIT:       int = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
+_LOGIN_RATE_LIMIT: int = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "5"))
 _rate_buckets: dict[str, deque] = defaultdict(deque)
 
 
-def _check_rate_limit(user_id: str) -> None:
+def _check_rate_limit(key: str, limit: int = _RATE_LIMIT) -> None:
     now    = time.time()
-    bucket = _rate_buckets[user_id]
+    bucket = _rate_buckets[key]
     while bucket and bucket[0] < now - _RATE_WINDOW_S:
         bucket.popleft()
-    if len(bucket) >= _RATE_LIMIT:
-        logger.warning(f"[api] Rate limit exceeded for user {user_id[:8]}...")
+    if len(bucket) >= limit:
+        logger.warning(f"[api] Rate limit exceeded for key {key[:12]}...")
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded. Max {_RATE_LIMIT} requests per minute.",
+            detail=f"Too many requests. Please wait {_RATE_WINDOW_S} seconds.",
             headers={"Retry-After": str(_RATE_WINDOW_S)},
         )
     bucket.append(now)
 
 
 def _auth(user: dict = Depends(_get_current_user)) -> dict:
-    """Combined JWT auth + rate-limit dependency."""
-    _check_rate_limit(user["sub"])
+    """Combined JWT auth + rate-limit dependency for /query."""
+    _check_rate_limit(user["sub"], _RATE_LIMIT)
     return user
 
 
@@ -128,6 +131,51 @@ class QueryResponse(BaseModel):
     relevance:    float
     latency_ms:   float
     error:        Optional[str] = None
+
+
+# ── Compliance audit log ─────────────────────────────────────────────────────
+
+def _write_audit_log(
+    tenant_id: str, customer_id: str,
+    question: str, result: dict, latency_ms: float,
+) -> None:
+    """
+    Write every query + response to query_audit_log. Non-fatal — a log failure
+    must never break the response to the caller.
+
+    Required for SEC/FINRA compliance: AI responses to customers are business
+    communications that must be retained for 7 years with full audit trail.
+    """
+    import json
+    import psycopg2
+    import psycopg2.extras
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return
+    try:
+        conn = psycopg2.connect(url, connect_timeout=3)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO query_audit_log
+                        (tenant_id, customer_id, question, query_type, data_source,
+                         answer, sources, faithfulness, relevance, latency_ms, error)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        tenant_id, customer_id, question,
+                        result.get("query_type"), result.get("data_source"),
+                        result.get("answer"), psycopg2.extras.Json(result.get("sources", [])),
+                        result.get("faithfulness"), result.get("relevance"),
+                        latency_ms, result.get("error"),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[api] audit log write failed (non-fatal): {type(e).__name__}: {e}")
 
 
 # ── Health / readiness ────────────────────────────────────────────────────────
@@ -219,6 +267,11 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
             f"data_source={result.get('data_source','rag')} "
             f"faith={result.get('faithfulness',0):.2f} "
             f"rel={result.get('relevance',0):.2f}"
+        )
+
+        _write_audit_log(
+            tenant_id=tenant_id, customer_id=customer_id,
+            question=req.question, result=result, latency_ms=latency_ms,
         )
 
         return QueryResponse(
