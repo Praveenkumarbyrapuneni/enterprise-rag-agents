@@ -677,6 +677,26 @@ Rejected: upsert-on-every-run without a status check. At 1 million documents/day
 re-processing a document that already succeeded wastes Bedrock embedding cost
 and risks creating duplicate vectors.
 
+### Custom Sharding Deferred to Phase B
+
+Qdrant supports custom sharding (`ShardingMethod.CUSTOM`) where each tenant's
+vectors route to a dedicated shard. On a multi-node Qdrant cluster, this means
+Goldman's vectors physically live on different nodes from Apple's — true
+hardware-level isolation.
+
+On a single Docker node (Phase A), custom sharding has no benefit. All shards
+live on the same machine. The complexity is real (shard keys must be created
+per tenant before any upsert, causing `Shard key not found` errors) with zero
+isolation gain over payload filtering.
+
+Decision: custom sharding skipped in Phase A. Payload filter + KEYWORD index
+provides logical isolation with equivalent security. Custom sharding added in
+Phase B when deploying to a multi-node Qdrant cluster on AWS.
+
+This decision was discovered the hard way: custom sharding was implemented,
+the re-ingestion script crashed with `Shard key "apple" not found`, and the
+feature was removed after diagnosing that it adds no value on a single node.
+
 ### tenant_id Payload Index Created Before First Write
 
 Qdrant allows adding payload indexes at any time — but adding one after data

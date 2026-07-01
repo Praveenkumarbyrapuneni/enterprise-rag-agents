@@ -153,6 +153,41 @@ retrieves random chunks — worse than embedding the original question directly.
 The 20-character minimum discards these degenerate cases. The system falls
 back to direct question embedding, which is the safer path when HyDE fails.
 
+### Two Validation Guards in _validate()
+
+**Guard 1: comparative type with no sub-questions falls back to original question**
+
+```python
+if needs_decomposition and not sub_questions:
+    logger.warning("needs_decomposition=true but sub_questions empty — fallback")
+    sub_questions = [question]
+    needs_decomposition = False
+```
+
+Haiku classifies the question as comparative but fails to generate sub-questions
+(JSON parse error, empty list, all strings were blank). Without this guard, the
+retriever receives `sub_questions=[]` and only searches with the original question
+— acceptable, but the decomposition signal is silently lost.
+
+With this guard: the original question is used as the single sub-question.
+Retrieval proceeds. The failure is logged. The analyst gets an answer.
+
+**Guard 2: non-decomposable types always get empty sub_questions**
+
+```python
+if query_type not in ("comparative", "multi_company"):
+    sub_questions = []
+    needs_decomposition = False
+```
+
+If Haiku incorrectly sets `sub_questions` on a `numerical` or `conceptual` query
+(hallucination in the classification step), this guard strips them unconditionally.
+
+Without it: the retriever runs 3 separate Qdrant searches for a simple numerical
+question — wasted Bedrock embedding calls and potentially worse results from
+over-searching. The guard enforces the research finding that decomposition
+hurts single-entity queries regardless of what the LLM thinks.
+
 ### sql and hybrid Query Types
 
 Standard RAG systems treat every question as a document retrieval problem.
