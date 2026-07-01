@@ -6,6 +6,68 @@ issues discovered during development.
 
 ---
 
+## Logger
+
+### TimedRotatingFileHandler — Midnight Rotation, 30-Day Retention
+
+```python
+logging.handlers.TimedRotatingFileHandler(
+    filename=_LOG_FILE,
+    when="midnight",
+    backupCount=30,
+)
+```
+
+A single log file that never rotates grows forever. At 1,000 queries/minute
+with verbose logging, `rag.log` reaches gigabytes within weeks. Disk fills up.
+The process crashes. No logs from the crash period survive because they were
+never rotated out — they're in the file that just caused the crash.
+
+Midnight rotation creates a new file each day. `backupCount=30` keeps 30 days
+of history. Enough to cover audit requirements and post-incident investigations
+while preventing unbounded disk growth.
+
+### LOG_OUTPUT=cloudwatch → Stdout Only, Zero Code Change
+
+```python
+_LOG_OUTPUT = os.getenv("LOG_OUTPUT", "file").lower()
+
+if _LOG_OUTPUT == "file":
+    root.addHandler(file_handler)
+# cloudwatch: stdout only — ECS captures it automatically
+```
+
+ECS with the `awslogs` log driver ships everything written to stdout directly
+to CloudWatch Logs. No SDK call, no CloudWatch client, no IAM permission for
+`logs:PutLogEvents` from application code.
+
+Phase A (laptop): `LOG_OUTPUT=file` → logs go to `logs/rag.log`
+Phase B (AWS ECS): `LOG_OUTPUT=cloudwatch` → logs go to stdout → ECS ships to CloudWatch
+
+One environment variable change. Zero code changes. The logger's design
+anticipates the AWS migration from day one.
+
+### Global _INITIALIZED Guard — Prevents Duplicate Handlers
+
+```python
+_INITIALIZED = False
+
+def _setup():
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
+    ...
+    _INITIALIZED = True
+```
+
+Python's logging module attaches handlers to the root logger globally. If
+`get_logger()` is called from 10 different modules at import time, without
+the guard it would attach 10 StreamHandlers and 10 FileHandlers. Every log
+line would print 10 times — once per handler.
+
+The `_INITIALIZED` flag ensures `_setup()` runs exactly once per process
+regardless of how many modules import `get_logger()`.
+
 ## Query Analyzer
 
 ### Adaptive HyDE — Not Always-On

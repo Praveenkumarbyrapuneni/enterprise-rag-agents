@@ -19,6 +19,229 @@ Skipping it would leave a class of documents entirely invisible to the system.
 
 Rejected: a PDF-only parser. Breaks immediately when a client sends anything else.
 
+### Vision Client Singleton + 30-Second Timeout
+
+```python
+_vision_client    = None
+_vision_client_lock = threading.Lock()
+_VISION_TIMEOUT   = 30.0
+
+_vision_client = anthropic.Anthropic(api_key=key, timeout=_VISION_TIMEOUT)
+```
+
+A financial PDF with 50 embedded images would create 50 separate Anthropic client
+instances without the singleton — 50 connection pool setups in rapid succession.
+The double-checked locking pattern ensures one client is created regardless of
+concurrent calls.
+
+The 30-second timeout kills hung Vision calls. Without it, a single unresponsive
+Vision API call blocks the entire parser for up to 600 seconds (the library default),
+holding a Celery worker slot that should be processing other documents.
+
+### N-Column PDF Layout Detection
+
+Financial filings frequently use 2-column layouts (MD&A sections, footnotes).
+Standard PDF text extraction reads elements in the order they appear in the PDF
+stream — not in visual reading order. A 2-column page read left-to-right produces
+interleaved text from both columns, making it unreadable.
+
+Fix: x-center positions of all text blocks are analyzed. Gaps wider than 8% of
+page width indicate column gutters. Content is then emitted column-by-column,
+top-to-bottom within each column, columns left-to-right. Full-width elements
+(headers, wide tables spanning >60% of page width) interrupt column flow and are
+emitted at their correct vertical position.
+
+Works for 1, 2, 3, or more columns without configuration.
+
+### Text Blocks Overlapping Table Regions Excluded
+
+PDF text extraction and table extraction are separate operations. Without
+coordination, text inside a detected table appears twice: once as raw text
+blocks, once as a structured table from the table extractor.
+
+Fix: table bounding boxes are collected first. Any text block whose bounding box
+overlaps a table region is excluded from the text block list. Tables are always
+rendered as markdown, never as raw text.
+
+### Image Deduplication by xref Per Page
+
+The same image object in a PDF (company logo, repeated chart) can be referenced
+from multiple positions on the same page. Without deduplication, Vision is called
+once per reference — the same image is extracted and described multiple times.
+
+Fix: each image's `xref` (internal PDF object ID) is tracked in a set per page.
+An image with an already-seen xref is skipped. Vision is called exactly once
+per unique image per page.
+
+### Images Under 50×50px Skipped
+
+PDF documents contain thousands of decorative elements: horizontal rules,
+bullet point graphics, watermarks, icon borders. These are typically <50px
+in at least one dimension.
+
+Sending these to Vision is wasted API cost and produces noise in the extracted
+text ("small decorative line" repeated 200 times across a filing). The 50×50px
+threshold filters decorative elements while retaining all meaningful content
+images (charts, diagrams, photos).
+
+### Scanned Page Fallback at 150 DPI
+
+Some PDF pages contain no text layer at all — they are scanned images embedded
+in a PDF container. Standard text extraction returns zero content for these pages.
+
+When zero elements are extracted from a page, the parser treats it as a scanned
+page: renders it as a full-page bitmap at 150 DPI and sends it to Claude Vision.
+
+150 DPI: sufficient for OCR quality on financial text. Higher DPI increases
+file size and Vision processing time with diminishing accuracy returns.
+
+### PDF Vector Graphics Limitation — Acknowledged, Not Fixed
+
+Charts drawn as PDF path instructions (lines, rectangles, fills) are mathematically
+defined, not bitmaps. Both text extraction and image extraction are blind to them.
+
+The only fix is rendering every page as a bitmap and sending it to Vision —
+expensive for a 500-page filing with few charts. This limitation is documented
+explicitly in the parser module docstring rather than hidden.
+
+When this matters: quarterly earnings reports with bar charts showing revenue trends.
+The chart data is invisible to the parser. The surrounding text usually contains
+the same data in prose, which the parser does extract.
+
+### Password-Protected File Detection
+
+Both PDF and Excel parsers detect encrypted/password-protected files and raise
+a clear `ValueError` with the file path and instructions.
+
+Without this: PyMuPDF raises a cryptic `fitz.fitz.EmptyFileError` or processes
+the file silently returning 0 pages. The document enters the DLQ with a
+confusing error message. No one knows the file needs decryption.
+
+The clear ValueError goes into the DLQ `error_message` field. The operations
+team sees exactly what happened and what to do.
+
+### DOCX Text Boxes and Floating Elements
+
+Standard python-docx iterates `doc.paragraphs` — this misses floating text boxes
+(`wps:txbx` elements). Financial presentations use text boxes extensively for
+callout statistics, sidebar commentary, and highlighted figures.
+
+Fix: the body XML is iterated directly (not through python-docx's high-level API)
+using `doc.element.body`. Every `<w:drawing>` element is inspected for:
+- Inline images (`a:blip` elements)
+- Floating text boxes (`w:txbxContent`)
+- Embedded Excel charts (`c:chart`)
+
+All are extracted in their document position — not appended at the end.
+
+### DOCX Headers and Footers — All Sections, Deduplicated
+
+Financial filings use headers and footers for document identifiers, filing dates,
+and page numbers. Standard body extraction misses them entirely.
+
+Each DOCX section can have its own header and footer. Multiple sections with
+identical headers (common when the filing repeats the same header across all
+pages) would produce the same text multiple times without deduplication.
+
+Fix: headers and footers are extracted from all sections, tracked in a seen set,
+and included once each.
+
+### Excel Merged Cells Forward-Filled
+
+Excel reports frequently use merged cells for multi-column headers ("Q1 2024
+Revenue" spanning 4 columns). When pandas reads a merged cell, all but the
+first cell return `NaN`. The table appears to have empty columns.
+
+Fix: `df.ffill(axis=0).ffill(axis=1)` — forward-fill along both axes. Each
+merged cell's value propagates to all cells it logically covers.
+
+### Excel Drawing Content at Anchor Row Positions
+
+Excel images and charts are positioned at specific row anchors in the spreadsheet
+(e.g., a chart appears after row 15, between revenue and operating income rows).
+
+Without anchor position tracking, all embedded content is appended at the end
+of the table — destroying the relationship between the chart and the data it
+visualizes.
+
+Fix: anchor row positions are extracted from drawing XML. Embedded content is
+inserted immediately after its anchor row in the markdown output, preserving
+the visual relationship with surrounding data.
+
+### CSV Delimiter and Encoding Auto-Detection
+
+Financial data exports use varying delimiters (comma, tab, semicolon, pipe) and
+encodings (UTF-8, Latin-1, Windows-1252). Hardcoding either breaks on files
+from different systems.
+
+`sep=None, engine="python"` tells pandas to detect the delimiter automatically.
+UTF-8-sig handles BOM-prefixed files from Excel exports. Latin-1 fallback
+handles files from legacy financial systems that don't support Unicode.
+
+### HTML: script/style/nav/footer/header Stripped
+
+SEC filing HTML exports contain navigation menus, cookie banners, JavaScript
+blocks, and CSS style definitions. None of this is document content.
+
+Before DOM traversal, these tags are decomposed (removed from the tree). The
+parser operates on content only — no script code or navigation labels appear
+in the extracted text.
+
+### HTML Images from Three Sources
+
+HTML documents can embed images in three ways:
+1. `data:image/png;base64,...` — inline base64 (self-contained)
+2. `src="path/to/image.png"` — relative file path (local HTML exports)
+3. `src="https://..."` — remote URL (linked images)
+
+All three are resolved and sent to Vision. Missing any one of them leaves
+charts and diagrams in the filing invisible to the pipeline.
+
+Remote URLs use a 10-second timeout to avoid blocking the parser on slow
+external servers.
+
+### Email: cid: Inline Images Resolved Before HTML Traversal
+
+Corporate HTML emails embed images using the `cid:` scheme:
+`<img src="cid:uniqueid@domain.com">`. These reference MIME parts in the email,
+not external URLs. Standard HTML image resolution ignores `cid:` references
+entirely — all inline images are invisible.
+
+Fix: before HTML traversal, all MIME parts with a `Content-ID` header are
+collected into a `cid_images` dictionary mapping content ID to image bytes.
+During HTML traversal, `cid:` references are matched against this dictionary
+and resolved to Vision calls.
+
+### Email: cid Image NameError Bug Fixed
+
+The original `_walk_html_email` function did not accept `file_path` as a
+parameter. When a `cid:` image failed to extract, the exception handler tried
+to log `f"[{file_path}]..."` — but `file_path` was not in scope.
+
+Result: the real error (image extraction failed) caused a secondary NameError.
+The parser crashed with `NameError: name 'file_path' is not defined` — a
+completely misleading error that hid the actual cause.
+
+Fix: `file_path` added as a parameter to `_walk_html_email`, passed through
+from `parse_email`. The real error is now logged correctly.
+
+This is the category of bug that production reveals and local testing doesn't:
+it only triggers when a cid image extraction fails, which requires a specific
+email with a broken inline image.
+
+### Email: Attachments Parsed Recursively via Temporary Files
+
+Email attachments (PDFs, Word docs, Excel files) are parsed by extracting them
+to a temporary file, calling `parse_document()` on the temp file, then deleting
+the temp file in a `finally` block.
+
+Recursive parsing means a PDF attached to an email gets the full PDF parser
+treatment: N-column layout detection, table extraction, scanned page fallback.
+The attachment is not treated as a plain text blob.
+
+The `finally: os.unlink(tmp_path)` ensures temp files are always deleted even
+if the parse fails — no disk leak on error.
+
 ---
 
 ## Chunker
