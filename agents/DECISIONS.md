@@ -385,6 +385,94 @@ This keeps the graph linear and readable while supporting all three data paths.
 
 ---
 
+## API (FastAPI)
+
+### Liveness vs Readiness — Two Separate Probes
+
+```
+GET /health → always returns 200 if the process is alive
+GET /ready  → checks Qdrant + PostgreSQL connectivity
+```
+
+These solve different problems and must not be merged into one endpoint.
+
+`/health` (liveness): is the process running? If this fails, Kubernetes/ECS
+restarts the container. It never checks dependencies — a slow Qdrant should not
+cause the API container to restart. It just needs to know the process is alive.
+
+`/ready` (readiness): can the process serve traffic? If this fails, the load
+balancer stops sending requests to this instance but does NOT restart it. The
+instance waits for its dependencies to recover.
+
+Merging them into one endpoint means a Qdrant outage restarts all API containers
+in a loop instead of quietly taking them out of rotation until Qdrant recovers.
+
+### tenant_id Character Whitelist — Input Sanitization at the Boundary
+
+```python
+@field_validator("tenant_id")
+def tenant_id_not_empty(cls, v):
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    if not all(c in allowed for c in v):
+        raise ValueError("tenant_id contains invalid characters")
+    return v
+```
+
+`tenant_id` is used directly in Qdrant payload filters and PostgreSQL queries.
+Even though psycopg2 parameterization prevents SQL injection, a `tenant_id`
+containing `../`, null bytes, or control characters could:
+- Create confusing log entries that obscure audit trails
+- Potentially exploit filter logic in less-mature vector DBs
+- Fail in unexpected ways if the value reaches a file system path
+
+The whitelist enforces `[a-z0-9_-]` only — a character set that is safe in
+all contexts: SQL, JSON, URLs, log files, and Qdrant filter values.
+Validation happens at the API boundary before the value touches any system.
+
+### Generic Error Handler — Never Expose Stack Traces
+
+```python
+@app.exception_handler(Exception)
+async def generic_error_handler(request, exc):
+    logger.error(f"Unhandled exception: {type(exc).__name__}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
+```
+
+Without this handler, FastAPI returns Python stack traces on unhandled exceptions.
+Stack traces contain: file paths, function names, variable values, library
+versions. This information is directly useful for identifying attack vectors.
+
+The handler logs the full exception internally (visible in CloudWatch) and
+returns only a generic message to the caller. The engineer gets the debug
+information; the attacker gets nothing.
+
+### Sliding Window Rate Limiting — Per API Key
+
+```python
+_RATE_WINDOW_S = 60
+_RATE_LIMIT    = 10   # requests per minute per key
+
+def _check_rate_limit(api_key):
+    now = time.time()
+    bucket = _rate_buckets[api_key]
+    while bucket and bucket[0] < now - _RATE_WINDOW_S:
+        bucket.popleft()    # evict timestamps outside the window
+    if len(bucket) >= _RATE_LIMIT:
+        raise HTTPException(429, ...)
+    bucket.append(now)
+```
+
+Fixed window rate limiting (reset counter every 60s) allows burst abuse: send
+10 requests at 23:59:50, counter resets at midnight, send 10 more at 00:00:00 —
+20 requests in 20 seconds while staying within the limit.
+
+Sliding window: any 60-second window contains at most 10 requests. The deque
+holds timestamps of recent requests. Timestamps older than 60 seconds are evicted.
+No burst exploitation possible.
+
+Note: this is in-memory per-instance. Phase B replaces it with Redis-backed
+rate limiting shared across all ECS instances.
+
 ## DB Lookup
 
 ### Template-Based SQL, Not Raw Text2SQL
