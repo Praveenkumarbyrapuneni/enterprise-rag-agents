@@ -2,22 +2,20 @@
 api/main.py — FastAPI gateway for the Enterprise RAG system.
 
 Endpoints:
-  POST /query  — main query endpoint (authenticated, rate-limited)
-  GET  /health — liveness check (no auth, for load balancer)
-  GET  /ready  — readiness check (verifies Qdrant + PostgreSQL connectivity)
+  POST /auth/register — create a user account under a tenant
+  POST /auth/login    — returns a signed JWT
+  POST /query         — main query endpoint (JWT-authenticated, rate-limited)
+  GET  /health        — liveness check (no auth, for load balancer)
+  GET  /ready         — readiness check (verifies Qdrant + PostgreSQL connectivity)
 
 Auth:
-  X-API-Key header. Valid keys are comma-separated in API_KEYS env var.
-  Phase A: simple API key.
-  Phase B: swap for Cognito JWT verification — same endpoint, different middleware.
+  JWT Bearer token. Client logs in → receives token with tenant_id baked in.
+  /query reads tenant_id from the token — callers never pass it manually.
+  Phase B: swap _secret() to AWS Secrets Manager; add Cognito SSO option.
 
 Rate limiting:
-  In-memory sliding window: 10 requests/minute per API key.
+  In-memory sliding window: 10 requests/minute per user_id.
   Phase B: replace with Redis-backed rate limiting for multi-instance ECS deployment.
-
-Tenant routing:
-  tenant_id is supplied by the caller in the request body.
-  Phase B: extract from JWT claims instead (Cognito User Pool groups → tenant_id).
 
 Run locally:
   uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -29,9 +27,10 @@ from collections import defaultdict, deque
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
 
 load_dotenv()
@@ -39,6 +38,7 @@ load_dotenv()
 # Import pipeline — done at module level so the LangGraph graph compiles once
 from agents.graph import run_query
 from agents.logger import get_logger
+from api.auth import decode_token, router as auth_router
 
 logger = get_logger(__name__)
 
@@ -47,8 +47,8 @@ logger = get_logger(__name__)
 app = FastAPI(
     title="Enterprise RAG API",
     description="Production-grade RAG system for financial institutions.",
-    version="3.0.0",
-    docs_url="/docs",       # Swagger UI (disable in production)
+    version="4.0.0",
+    docs_url="/docs",
     redoc_url="/redoc",
 )
 
@@ -59,43 +59,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+app.include_router(auth_router)
 
-_VALID_API_KEYS: set[str] = set(
-    k.strip()
-    for k in os.getenv("API_KEYS", "dev-key-001").split(",")
-    if k.strip()
-)
+# ── Auth — JWT Bearer ─────────────────────────────────────────────────────────
+
+_bearer = HTTPBearer()
 
 
-def _get_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
-    """Validate API key. Phase B: replace with Cognito JWT verification."""
-    if x_api_key not in _VALID_API_KEYS:
-        logger.warning(f"[api] Rejected request with invalid API key: {x_api_key[:8]}...")
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
-    return x_api_key
+def _get_current_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
+    """
+    Decode JWT from Authorization: Bearer <token> header.
+    Returns the token payload: { sub, tenant_id, customer_id, exp }
+    """
+    return decode_token(creds.credentials)
 
 
-# ── Rate limiting (in-memory sliding window) ──────────────────────────────────
+# ── Rate limiting (in-memory sliding window, keyed on user_id) ───────────────
 
 _RATE_WINDOW_S: int = 60
 _RATE_LIMIT:    int = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
-
-# api_key → deque of request timestamps within the window
 _rate_buckets: dict[str, deque] = defaultdict(deque)
 
 
-def _check_rate_limit(api_key: str) -> None:
-    """Raise 429 if this key has exceeded _RATE_LIMIT requests in the last minute."""
+def _check_rate_limit(user_id: str) -> None:
     now    = time.time()
-    bucket = _rate_buckets[api_key]
-
-    # Evict timestamps outside the sliding window
+    bucket = _rate_buckets[user_id]
     while bucket and bucket[0] < now - _RATE_WINDOW_S:
         bucket.popleft()
-
     if len(bucket) >= _RATE_LIMIT:
-        logger.warning(f"[api] Rate limit exceeded for key {api_key[:8]}...")
+        logger.warning(f"[api] Rate limit exceeded for user {user_id[:8]}...")
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Max {_RATE_LIMIT} requests per minute.",
@@ -104,19 +96,17 @@ def _check_rate_limit(api_key: str) -> None:
     bucket.append(now)
 
 
-def _auth(api_key: str = Depends(_get_api_key)) -> str:
-    """Combined auth + rate-limit dependency."""
-    _check_rate_limit(api_key)
-    return api_key
+def _auth(user: dict = Depends(_get_current_user)) -> dict:
+    """Combined JWT auth + rate-limit dependency."""
+    _check_rate_limit(user["sub"])
+    return user
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
 
 
 class QueryRequest(BaseModel):
-    question:    str
-    tenant_id:   str
-    customer_id: str = "default_user"
+    question: str
 
     @field_validator("question")
     @classmethod
@@ -126,26 +116,6 @@ class QueryRequest(BaseModel):
             raise ValueError("question cannot be empty")
         if len(v) > 2000:
             raise ValueError("question exceeds 2000 character limit")
-        return v
-
-    @field_validator("tenant_id")
-    @classmethod
-    def tenant_id_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("tenant_id is required")
-        # Only allow safe characters — prevent injection at the application layer
-        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
-        if not all(c in allowed for c in v):
-            raise ValueError("tenant_id contains invalid characters (use a-z, 0-9, _, -)")
-        return v
-
-    @field_validator("customer_id")
-    @classmethod
-    def customer_id_safe(cls, v: str) -> str:
-        v = v.strip() or "default_user"
-        if len(v) > 100:
-            raise ValueError("customer_id too long")
         return v
 
 
@@ -218,10 +188,11 @@ def ready():
 
 
 @app.post("/query", response_model=QueryResponse, tags=["rag"])
-def query(req: QueryRequest, api_key: str = Depends(_auth)):
+def query(req: QueryRequest, user: dict = Depends(_auth)):
     """
     Run a question through the RAG pipeline.
 
+    tenant_id and customer_id come from the JWT — not from the request body.
     The pipeline routes automatically:
       - "What is my balance?" → SQL lookup (no document search)
       - "Why was I charged X?" → Hybrid (SQL + document policy)
@@ -229,15 +200,18 @@ def query(req: QueryRequest, api_key: str = Depends(_auth)):
 
     tenant_id scopes ALL searches — results are always isolated to the caller's tenant.
     """
+    tenant_id   = user["tenant_id"]
+    customer_id = user["customer_id"]
+
     logger.info(
-        f"[api] POST /query — tenant={req.tenant_id} customer={req.customer_id} "
+        f"[api] POST /query — tenant={tenant_id} customer={customer_id} "
         f"question='{req.question[:80]}'"
     )
 
     start = time.time()
 
     try:
-        result     = run_query(req.question, tenant_id=req.tenant_id, customer_id=req.customer_id)
+        result     = run_query(req.question, tenant_id=tenant_id, customer_id=customer_id)
         latency_ms = round((time.time() - start) * 1000, 2)
 
         logger.info(

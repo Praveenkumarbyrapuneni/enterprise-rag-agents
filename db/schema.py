@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS tenant_registry (
 CREATE INDEX IF NOT EXISTS idx_tenant_registry_tenant_id
     ON tenant_registry (tenant_id);
 
+-- Users: one row per login. tenant_id links them to their company's data.
+CREATE TABLE IF NOT EXISTS users (
+    user_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    username      TEXT         UNIQUE NOT NULL,
+    email         TEXT         UNIQUE NOT NULL,
+    password_hash TEXT         NOT NULL,
+    tenant_id     TEXT         NOT NULL,
+    customer_id   TEXT         NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users (tenant_id);
+
 -- Mock financial transactions for hybrid RAG demo.
 -- In production: replaced by a Kafka → PostgreSQL real-time pipeline.
 CREATE TABLE IF NOT EXISTS transactions (

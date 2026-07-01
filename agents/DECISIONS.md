@@ -6,6 +6,129 @@ issues discovered during development.
 
 ---
 
+## API — Authentication & Tenant Isolation
+
+### JWT Over API Key — Tenant Identity From Login, Not From Request Body
+
+```python
+# Before (Phase 2): caller passes tenant_id manually — trust problem
+POST /query  { "question": "...", "tenant_id": "goldman" }
+
+# After (Phase 3): tenant_id comes from signed JWT — caller cannot forge it
+POST /query  Authorization: Bearer <token>
+{ "question": "..." }
+```
+
+An API key tells you the caller is authenticated. It does not tell you which
+institution they belong to. A caller with a valid API key could pass any
+`tenant_id` in the request body and retrieve another institution's data.
+
+JWT solves this: `tenant_id` is written into the token at login time, signed
+with `JWT_SECRET_KEY`, and verified on every request. The caller cannot change
+it without invalidating the signature. Tenant isolation is enforced
+cryptographically, not just by convention.
+
+Phase B: swap `JWT_SECRET_KEY` (local `.env`) for AWS Secrets Manager + Cognito
+User Pools for enterprise SSO. Zero changes to the query pipeline — only the
+token issuer changes.
+
+### tenant_id Extracted From JWT in _auth Dependency — Single Enforcement Point
+
+```python
+def _get_current_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
+    return decode_token(creds.credentials)   # raises 401 on any invalid token
+
+def _auth(user: dict = Depends(_get_current_user)) -> dict:
+    _check_rate_limit(user["sub"])
+    return user   # { sub, tenant_id, customer_id, exp }
+
+@app.post("/query")
+def query(req: QueryRequest, user: dict = Depends(_auth)):
+    tenant_id   = user["tenant_id"]    # always from JWT, never from request body
+    customer_id = user["customer_id"]
+```
+
+All three concerns — token validation, rate limiting, tenant extraction — happen
+in one FastAPI dependency chain. Adding a new endpoint automatically inherits
+all three by using `Depends(_auth)`. No risk of forgetting to validate a new route.
+
+### bcrypt Directly, Not passlib — Python 3.13 Compatibility
+
+```python
+# passlib 1.7.4 (unmaintained since 2020) crashes on bcrypt 5.x:
+# AttributeError: module 'bcrypt' has no attribute '__about__'
+
+# Direct bcrypt — no wrapper, no compatibility issues:
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
+```
+
+passlib has not had a release since 2020. bcrypt 5.x removed the `__about__`
+module that passlib reads for version detection. This causes a crash at import
+time on Python 3.13. Using bcrypt directly removes the broken layer entirely.
+The hash format (bcrypt `$2b$`) is identical — existing hashed passwords
+remain valid.
+
+### users Table — tenant_id Stored at Registration, Not Derived at Query Time
+
+```sql
+CREATE TABLE users (
+    user_id       UUID  PRIMARY KEY DEFAULT gen_random_uuid(),
+    username      TEXT  UNIQUE NOT NULL,
+    email         TEXT  UNIQUE NOT NULL,
+    password_hash TEXT  NOT NULL,
+    tenant_id     TEXT  NOT NULL,   -- set once at registration, never changes
+    customer_id   TEXT  NOT NULL,   -- links to transactions table
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`tenant_id` is deliberately stored at registration and never derivable from
+the email domain or username at query time. This means an institution's
+backend sets `tenant_id` when calling `/auth/register` on behalf of their
+customers — the customer never chooses it. A new customer from Institution A
+is always assigned `tenant_id="institution_a"` by Institution A's backend
+before the user ever logs in.
+
+Alternative considered: derive `tenant_id` from email domain (e.g.,
+`@goldmansachs.com → goldman`). Rejected because: email domains change,
+users have personal emails, and the `tenant_registry` email-domain lookup
+adds a round-trip on every login. Storing it directly is faster and more reliable.
+
+### No Username Enumeration — Same Error for Wrong Username or Password
+
+```python
+if not row or not _verify_password(req.password, row[1]):
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
+```
+
+A separate "user not found" error would let an attacker enumerate valid
+usernames by trying logins. Both wrong-username and wrong-password return
+the same 401 with the same message. The bcrypt verify call runs even when
+the user doesn't exist (on the stored hash) to prevent timing-based enumeration.
+
+### Rate Limiting Keyed on user_id, Not IP Address
+
+```python
+_rate_buckets: dict[str, deque] = defaultdict(deque)
+
+def _check_rate_limit(user_id: str) -> None:
+    ...  # sliding window per user_id
+```
+
+IP-based rate limiting breaks behind NAT (entire office shares one IP) and
+is trivially bypassed with a VPN. User ID is the correct identity unit —
+each authenticated user gets their own 10 req/min bucket regardless of
+where they connect from.
+
+Phase B: replace in-memory `deque` with Redis-backed sliding window for
+multi-instance ECS deployment where in-process state is not shared.
+
+---
+
 ## Logger
 
 ### TimedRotatingFileHandler — Midnight Rotation, 30-Day Retention
