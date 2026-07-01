@@ -47,6 +47,29 @@ searches. Sub-questions are capped at 4 to prevent over-decomposition.
 Research basis: ACL 2025 (arxiv 2507.00355) — query decomposition increases
 MRR by 36.7% on multi-hop queries but degrades single-hop performance.
 
+### Silent Failure Is Not Acceptable — Fallback Instead of Crash
+
+The Query Analyzer makes a Bedrock call on every single query. If that call
+fails — timeout, throttle, wrong model ID, network blip — there are two options:
+
+Option A: raise the exception → entire pipeline crashes → user gets a 500 error
+Option B: catch the exception → log a warning → fall back to safe defaults
+
+Option A was rejected. A classification failure is not a reason to give the
+user zero answer. The fallback returns `query_type=general, data_source=rag`
+which routes the question to Qdrant. The answer quality may be slightly lower
+(no HyDE, no sub-question splitting) but the system still returns something useful.
+
+```python
+except (ClientError, json.JSONDecodeError, KeyError, IndexError) as e:
+    logger.warning(f"[analyzer] Failed ({type(e).__name__}: {e}) — falling back")
+    result = _fallback(question)
+```
+
+The warning is always logged — the failure is visible in CloudWatch. It is
+never swallowed silently. The difference between this and silent failure:
+silent failure hides the problem; this surfaces it while keeping the system alive.
+
 ### sql and hybrid Query Types
 
 Standard RAG systems treat every question as a document retrieval problem.
@@ -64,6 +87,88 @@ Two new query types were added:
 ---
 
 ## Retriever
+
+### Process-Level Singleton Clients — Not Per-Request
+
+The Qdrant client and Bedrock client are created once per worker process and
+reused across all queries:
+
+```python
+_bedrock_client: Optional[object] = None
+_qdrant_client:  Optional[QdrantClient] = None
+
+def _get_qdrant() -> QdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(...)
+    return _qdrant_client
+```
+
+Creating a new client on every query means:
+- TCP handshake on every request (~50-200ms overhead)
+- TLS negotiation on every HTTPS call to Bedrock (~100ms)
+- Connection pool rebuilt from scratch every time
+
+At 1,000 queries/minute, per-request clients add 150-300ms to every query and
+exhaust the system's file descriptor limit (too many open connections).
+
+Singleton clients reuse the same connection pool. The worker initializes once,
+then serves thousands of queries through the same warm connection.
+
+### Qdrant Retry with Exponential Backoff — 3 Attempts
+
+Every Qdrant search retries up to 3 times on connection errors and 5xx responses:
+
+```python
+_QDRANT_RETRIES = 3
+_RETRY_DELAYS   = [1, 2, 4]   # seconds between attempts
+```
+
+Attempt 1 fails → wait 1s → attempt 2 fails → wait 2s → attempt 3 fails → raise.
+
+Why 3 retries and not more: Qdrant transient errors (network blip, brief
+overload) typically resolve within 1-2 seconds. If it hasn't recovered after
+7 seconds (1+2+4), it is likely a real outage, not a transient blip. Retrying
+more just delays the error response to the user.
+
+### 4xx vs 5xx Distinction — Never Retry Caller Errors
+
+Qdrant errors are categorized before deciding whether to retry:
+
+```python
+except UnexpectedResponse as e:
+    if e.status_code >= 500:
+        last_exc = e    # server error — retriable
+    else:
+        raise           # 4xx — caller error, raise immediately
+```
+
+A 400 means the query itself is malformed — wrong dimensions, invalid filter
+syntax, collection doesn't exist. Retrying the same malformed query 3 times
+wastes 7 seconds and returns the same error. Raise immediately.
+
+A 503 means Qdrant is temporarily overloaded. Retry after backoff — it will
+likely recover.
+
+### Cohere Timeout via ThreadPoolExecutor — SDK Has No Timeout Param
+
+The Cohere reranker SDK does not expose a timeout parameter. If Cohere's API
+hangs, the call blocks indefinitely — freezing the worker.
+
+Fix: run the Cohere call inside a `ThreadPoolExecutor` with a timeout:
+
+```python
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    future = executor.submit(_call_cohere)
+    return future.result(timeout=_COHERE_TIMEOUT)  # 12 seconds
+```
+
+If the call doesn't complete in 12 seconds, `TimeoutError` is raised and the
+system falls back to raw vector order (reranking skipped). The query still
+completes — it just returns slightly lower-quality results.
+
+Cohere's p50 latency is 100-400ms. A 12-second timeout catches genuine hangs
+while never triggering on normal slow responses.
 
 ### Cohere Reranker Over BM25 Hybrid Search
 
@@ -201,6 +306,26 @@ Deterministic checks run before the LLM judge to avoid unnecessary Bedrock calls
 - Answer with no chunks → 0.0/0.0 (synthesizer answered from memory — not permitted)
 
 Only answers that pass deterministic checks reach the Haiku judge.
+
+### Conservative Fallback When Judge Fails
+
+If the Haiku judge call fails (Bedrock timeout, throttle, JSON parse error),
+the evaluator does not crash or return 0/0:
+
+```python
+except (ClientError, json.JSONDecodeError, KeyError) as e:
+    logger.warning(f"[evaluator] Haiku judge failed — conservative scores (0.7, 0.7)")
+    return 0.7, 0.7, f"judge unavailable: {type(e).__name__}"
+```
+
+0.7/0.7 sits below the pass threshold (0.85/0.80) — so the graph routes to
+a retry. After the retry, if the judge fails again, max retries are reached
+and the answer is returned with a confidence warning.
+
+Why 0.7 and not 0.0: returning 0.0/0.0 on judge failure would make the
+system look like it has a bad answer when it might have a perfectly good one.
+0.7 says "borderline — try once more" which is the correct conservative action.
+It never passes a bad answer, and it never wrongly discards a good one.
 
 ### SQL Answers Auto-Pass
 

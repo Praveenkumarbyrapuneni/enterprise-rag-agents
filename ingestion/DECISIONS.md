@@ -177,6 +177,41 @@ The `tenant_id` KEYWORD payload index is created when the collection is
 initialized, before any data is written. Same applies to `file_hash`,
 `file_name`, `strategy`, and `page`.
 
+### 4xx vs 5xx Error Distinction — Never Retry Caller Errors
+
+The Qdrant batch uploader distinguishes between two categories of errors:
+
+```python
+except UnexpectedResponse as e:
+    if e.status_code >= 500:
+        pass   # Qdrant server error — retriable
+    else:
+        raise  # 4xx — not retriable, raise immediately
+```
+
+5xx errors: Qdrant server crashed, out of memory, overloaded. These are
+transient — retrying after a backoff usually succeeds.
+
+4xx errors: the request itself is malformed. Wrong collection name, invalid
+vector dimensions, bad payload format. Retrying the same bad request 5 times
+produces the same error 5 times. Raise immediately and let the DLQ record it.
+
+This pattern applies everywhere in the system — Qdrant, Bedrock, PostgreSQL.
+4xx = fix the code. 5xx = wait and retry.
+
+### Jitter on Qdrant Batch Retry
+
+The Qdrant batch uploader uses the same jitter principle as the orchestrator:
+
+```python
+wait = delay + random.uniform(0, 0.5 * delay)
+delay *= 2
+```
+
+Starting at 1s, doubling each attempt, with 0-50% random jitter added.
+At batch size 256 points, 100 parallel workers retrying Qdrant simultaneously
+would saturate its write buffer. Jitter prevents the synchronized retry storm.
+
 ### wait=False on Upsert
 
 `wait=False` tells Qdrant to acknowledge the write before updating the HNSW
@@ -189,6 +224,90 @@ The next run's Phase 1 detects this and re-uploads from scratch. No data loss.
 ---
 
 ## Orchestrator
+
+### Exponential Backoff + Jitter — Thundering Herd Prevention
+
+When a transient error happens (network blip, Qdrant momentarily unavailable),
+a naive retry fires immediately. When 100 Celery workers all fail at the same
+moment and all retry at the same moment, they hit the same overloaded service
+simultaneously — making it worse. This is called the thundering herd problem.
+
+The retry delay formula used:
+```python
+retry_in = min(2 ** self.request.retries + random.uniform(0, 1), 60)
+```
+
+What this means:
+```
+Worker A fails, retries=0: waits 2^0 + 0.73s = 1.73s
+Worker B fails, retries=0: waits 2^0 + 0.12s = 1.12s
+Worker C fails, retries=0: waits 2^0 + 0.91s = 1.91s
+
+All three hit the service at different times — load is spread out.
+
+On retry 1: ~2-3s wait
+On retry 2: ~4-5s wait
+On retry 3: ~8-9s wait
+Max wait:   60s (capped — doesn't grow forever)
+```
+
+The `random.uniform(0, 1)` is the jitter — a random number added to each
+worker's wait time so no two workers retry in sync. Without it, exponential
+backoff alone still causes synchronized retries because all workers started
+at the same time.
+
+### Transient vs Non-Transient Error Classification
+
+Not every error is worth retrying. Retrying a bad input wastes workers.
+
+```python
+TRANSIENT_ERRORS = (
+    ConnectionError, TimeoutError, OSError,       # network issues
+    BrokenPipeError, ConnectionResetError,         # connection drops
+)
+```
+
+Transient errors → retry with backoff. These usually resolve on their own.
+
+Everything else (ValidationError, bad file format, corrupt PDF, wrong model ID)
+→ skip retries entirely → go straight to DLQ.
+
+Retrying a corrupt PDF 3 times before giving up wastes 3 worker slots and
+delays other documents in the queue. Detect immediately, fail fast, record it.
+
+### Full Traceback Stored in DLQ
+
+The failed_documents table stores the complete Python traceback, not just the
+error message.
+
+```
+error_message:   "ValidationException: model ID invalid"        ← what
+error_traceback: "File orchestrator.py, line 330, in ingest..." ← where exactly
+retry_count:     3                                               ← how many times we tried
+celery_task_id:  "abc-123-..."                                   ← which worker ran it
+```
+
+Without the traceback, debugging a production failure requires reproducing the
+error. With the traceback, the engineer sees the exact file, line, and call
+stack without touching the running system.
+
+### Celery soft_time_limit=600
+
+```python
+@celery_app.task(soft_time_limit=600, ...)
+def ingest_document(...):
+```
+
+`soft_time_limit` raises a `SoftTimeLimitExceeded` exception inside the task
+after 600 seconds (10 minutes). The task can catch it and clean up gracefully
+before the hard kill signal arrives.
+
+Without this, a hung task (network call that never times out, infinite loop in
+parser) holds a worker slot forever. Every worker eventually hangs, the queue
+backs up, and the entire ingestion system stops processing new documents.
+
+600 seconds is generous — normal ingestion takes 30-120 seconds per document.
+A task running past 10 minutes has almost certainly hung.
 
 ### Celery + Redis Over Threading
 
