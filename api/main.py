@@ -22,8 +22,6 @@ Run locally:
 """
 
 import os
-import time
-from collections import defaultdict, deque
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -39,24 +37,30 @@ load_dotenv()
 from agents.graph import run_query
 from agents.logger import get_logger
 from api.auth import decode_token, router as auth_router
+from api.rate_limit import check_rate_limit, RATE_LIMIT
 
 logger = get_logger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 app = FastAPI(
     title="Enterprise RAG API",
     description="Production-grade RAG system for financial institutions.",
-    version="4.0.0",
+    version="4.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # Phase B: restrict to your frontend domain
+    # Set ALLOWED_ORIGINS in .env for production (e.g. "https://app.yourbank.com").
+    # Wildcard is only safe during local development — a real origin must be set
+    # before this API serves financial data from a browser client.
+    allow_origins=_ALLOWED_ORIGINS if _ALLOWED_ORIGINS else ["*"],
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(auth_router)
@@ -69,39 +73,15 @@ _bearer = HTTPBearer()
 def _get_current_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
     """
     Decode JWT from Authorization: Bearer <token> header.
-    Returns the token payload: { sub, tenant_id, customer_id, exp }
+    decode_token validates all required claims — raises 401 on missing fields,
+    never raises KeyError to the caller.
     """
     return decode_token(creds.credentials)
 
 
-# ── Rate limiting (in-memory sliding window) ─────────────────────────────────
-# Keyed on user_id for /query, on username/IP for /auth/login (brute-force protection).
-# Phase B: replace with Redis-backed window for multi-instance ECS deployment.
-
-_RATE_WINDOW_S:    int = 60
-_RATE_LIMIT:       int = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
-_LOGIN_RATE_LIMIT: int = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "5"))
-_rate_buckets: dict[str, deque] = defaultdict(deque)
-
-
-def _check_rate_limit(key: str, limit: int = _RATE_LIMIT) -> None:
-    now    = time.time()
-    bucket = _rate_buckets[key]
-    while bucket and bucket[0] < now - _RATE_WINDOW_S:
-        bucket.popleft()
-    if len(bucket) >= limit:
-        logger.warning(f"[api] Rate limit exceeded for key {key[:12]}...")
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many requests. Please wait {_RATE_WINDOW_S} seconds.",
-            headers={"Retry-After": str(_RATE_WINDOW_S)},
-        )
-    bucket.append(now)
-
-
 def _auth(user: dict = Depends(_get_current_user)) -> dict:
     """Combined JWT auth + rate-limit dependency for /query."""
-    _check_rate_limit(user["sub"], _RATE_LIMIT)
+    check_rate_limit(user["sub"], RATE_LIMIT)
     return user
 
 
@@ -135,6 +115,9 @@ class QueryResponse(BaseModel):
 
 # ── Compliance audit log ─────────────────────────────────────────────────────
 
+_BEDROCK_SONNET = os.getenv("BEDROCK_SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+
+
 def _write_audit_log(
     tenant_id: str, customer_id: str,
     question: str, result: dict, latency_ms: float,
@@ -143,14 +126,14 @@ def _write_audit_log(
     Write every query + response to query_audit_log. Non-fatal — a log failure
     must never break the response to the caller.
 
-    Required for SEC/FINRA compliance: AI responses to customers are business
-    communications that must be retained for 7 years with full audit trail.
+    Called from the finally block of /query so BOTH successful and failed queries
+    are recorded — required for SEC/FINRA 7-year retention.
     """
-    import json
     import psycopg2
     import psycopg2.extras
     url = os.getenv("DATABASE_URL")
     if not url:
+        logger.warning("[api] audit log skipped — DATABASE_URL not set")
         return
     try:
         conn = psycopg2.connect(url, connect_timeout=3)
@@ -160,15 +143,19 @@ def _write_audit_log(
                     """
                     INSERT INTO query_audit_log
                         (tenant_id, customer_id, question, query_type, data_source,
-                         answer, sources, faithfulness, relevance, latency_ms, error)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         answer, sources, faithfulness, relevance, latency_ms,
+                         model_id, error)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         tenant_id, customer_id, question,
                         result.get("query_type"), result.get("data_source"),
-                        result.get("answer"), psycopg2.extras.Json(result.get("sources", [])),
+                        result.get("answer"),
+                        psycopg2.extras.Json(result.get("sources", [])),
                         result.get("faithfulness"), result.get("relevance"),
-                        latency_ms, result.get("error"),
+                        latency_ms,
+                        _BEDROCK_SONNET,
+                        result.get("error"),
                     ),
                 )
             conn.commit()
@@ -248,6 +235,7 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
 
     tenant_id scopes ALL searches — results are always isolated to the caller's tenant.
     """
+    import time
     tenant_id   = user["tenant_id"]
     customer_id = user["customer_id"]
 
@@ -256,7 +244,9 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
         f"question='{req.question[:80]}'"
     )
 
-    start = time.time()
+    start      = time.time()
+    result     = {}
+    latency_ms = 0.0
 
     try:
         result     = run_query(req.question, tenant_id=tenant_id, customer_id=customer_id)
@@ -269,10 +259,10 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
             f"rel={result.get('relevance',0):.2f}"
         )
 
-        _write_audit_log(
-            tenant_id=tenant_id, customer_id=customer_id,
-            question=req.question, result=result, latency_ms=latency_ms,
-        )
+        # Sanitize the error field — internal error strings (DB errors, Bedrock model IDs,
+        # stack traces) must never reach the caller. Log them internally, return generic text.
+        raw_error      = result.get("error")
+        safe_error     = "Pipeline completed with reduced confidence." if raw_error else None
 
         return QueryResponse(
             answer       = result["answer"],
@@ -282,17 +272,25 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
             faithfulness = result["faithfulness"],
             relevance    = result["relevance"],
             latency_ms   = latency_ms,
-            error        = result.get("error"),
+            error        = safe_error,
         )
 
     except HTTPException:
-        raise   # re-raise FastAPI exceptions as-is
+        raise
 
     except Exception as e:
         latency_ms = round((time.time() - start) * 1000, 2)
-        msg        = f"{type(e).__name__}: {e}"
-        logger.error(f"[api] Unhandled pipeline error after {latency_ms}ms: {msg}")
+        logger.error(f"[api] Unhandled pipeline error after {latency_ms}ms: {type(e).__name__}: {e}")
+        result = {"error": f"{type(e).__name__}: {e}"}
         raise HTTPException(status_code=500, detail="Internal pipeline error. Please try again.")
+
+    finally:
+        # Always write audit log — success AND failure — for SEC/FINRA compliance.
+        # result is {} on early exception but still records the attempt.
+        _write_audit_log(
+            tenant_id=tenant_id, customer_id=customer_id,
+            question=req.question, result=result, latency_ms=latency_ms,
+        )
 
 
 # ── Error handlers ────────────────────────────────────────────────────────────
