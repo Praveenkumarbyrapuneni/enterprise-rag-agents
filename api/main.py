@@ -22,6 +22,7 @@ Run locally:
 """
 
 import os
+import re
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -65,6 +66,37 @@ app.add_middleware(
 
 app.include_router(auth_router)
 
+
+# ── Fork-safe startup hook ────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def _reset_singletons() -> None:
+    """
+    Reset all process-level boto3 and Qdrant singletons on worker startup.
+
+    Problem this solves:
+      uvicorn --workers N uses fork() to spawn N worker processes. If any
+      boto3 or Qdrant client is created BEFORE the fork (e.g., during a
+      health check warm-up), all workers inherit the SAME client object.
+      boto3 clients are not fork-safe — concurrent AWS API calls from
+      different OS processes on the same TCP connection produce ConnectionReset
+      and BrokenPipe errors that look like random Bedrock failures.
+
+    Fix: reset every singleton to None on startup. Each worker then creates
+    its own client independently on first use. The double-checked locking
+    in each _get_bedrock() function ensures only one client per worker.
+    """
+    import agents.retriever    as _r
+    import agents.synthesizer  as _s
+    import agents.evaluator    as _e
+    import agents.query_analyzer as _q
+    _r._bedrock_client = None
+    _r._qdrant_client  = None
+    _s._bedrock_client = None
+    _e._bedrock_client = None
+    _q._bedrock_client = None
+    logger.info("[startup] singletons reset — each worker will create its own clients")
+
 # ── Auth — JWT Bearer ─────────────────────────────────────────────────────────
 
 _bearer = HTTPBearer()
@@ -88,6 +120,21 @@ def _auth(user: dict = Depends(_get_current_user)) -> dict:
 # ── Request / Response models ─────────────────────────────────────────────────
 
 
+# Prompt injection patterns — phrases that attempt to override system instructions.
+# Not a complete defense (LLMs can be creative), but eliminates the obvious attacks.
+# Real mitigation: strict system prompt (already in synthesizer.py) + output validation
+# (evaluator.py) + tenant_id/customer_id never from LLM output (always from JWT).
+_INJECTION_PATTERNS = re.compile(
+    r"ignore\s+(all\s+)?previous\s+instructions|"
+    r"you\s+are\s+now\s+(a\s+)?|"
+    r"disregard\s+(all\s+)?prior|"
+    r"new\s+instructions?\s*:|"
+    r"system\s*prompt\s*:|"
+    r"<\s*system\s*>",
+    re.IGNORECASE,
+)
+
+
 class QueryRequest(BaseModel):
     question: str
 
@@ -99,6 +146,11 @@ class QueryRequest(BaseModel):
             raise ValueError("question cannot be empty")
         if len(v) > 2000:
             raise ValueError("question exceeds 2000 character limit")
+        # Strip null bytes and control characters before they reach any LLM prompt.
+        v = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", v)
+        # Block obvious prompt injection attempts.
+        if _INJECTION_PATTERNS.search(v):
+            raise ValueError("question contains invalid content")
         return v
 
 

@@ -17,16 +17,19 @@ Phase B: swap _secret() to AWS Secrets Manager; replace bcrypt with Cognito User
 """
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
 import psycopg2
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
 
 from agents.logger import get_logger
 from api.rate_limit import check_rate_limit, LOGIN_RATE_LIMIT, RATE_LIMIT
+from api.token_store import revoke, is_revoked
 
 logger = get_logger(__name__)
 
@@ -141,6 +144,7 @@ def _make_token(user_id: str, tenant_id: str, customer_id: str) -> str:
         "sub":         user_id,
         "tenant_id":   tenant_id,
         "customer_id": customer_id,
+        "jti":         str(uuid.uuid4()),   # unique token ID — enables revocation on logout
         "exp":         datetime.now(timezone.utc) + timedelta(hours=_TTL),
     }
     return jwt.encode(payload, _secret(), algorithm=_ALG)
@@ -148,8 +152,12 @@ def _make_token(user_id: str, tenant_id: str, customer_id: str) -> str:
 
 def decode_token(token: str) -> dict:
     """
-    Decode and validate a JWT. Raises HTTPException(401) on any failure,
-    including missing required claims — never raises KeyError to the caller.
+    Decode and validate a JWT. Raises HTTPException(401) on any failure:
+    - Expired signature
+    - Invalid signature (wrong secret, tampered payload)
+    - Missing required claims (sub, tenant_id, customer_id)
+    - Explicitly revoked token (user logged out)
+    Never raises KeyError to the caller.
     """
     try:
         payload = jwt.decode(token, _secret(), algorithms=[_ALG])
@@ -158,13 +166,43 @@ def decode_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token.")
 
-    # Validate required claims explicitly — a token signed with the correct secret
-    # but missing fields would otherwise cause KeyError inside query() → 500 not 401.
-    for field in ("sub", "tenant_id", "customer_id"):
+    # Validate required claims — a token missing fields raises KeyError without this check.
+    for field in ("sub", "tenant_id", "customer_id", "jti"):
         if not payload.get(field):
             raise HTTPException(status_code=401, detail="Invalid token: missing required claims.")
 
+    # Check revocation — token may be valid but explicitly invalidated by logout.
+    if is_revoked(payload["jti"]):
+        raise HTTPException(status_code=401, detail="Token has been revoked. Please log in again.")
+
     return payload
+
+
+# ── Logout ────────────────────────────────────────────────────────────────────
+
+_bearer = HTTPBearer()
+
+
+@router.post("/logout", status_code=200)
+def logout(creds: HTTPAuthorizationCredentials = Depends(_bearer)):
+    """
+    Revoke the caller's JWT immediately.
+
+    After logout, the token is invalid even if it has not expired.
+    Use this when a user explicitly logs out or when a breach is detected.
+
+    Note: revocation is in-memory — survives until process restart.
+    Phase B: persist to Redis with TTL = JWT_EXPIRE_HOURS.
+    """
+    try:
+        payload = jwt.decode(creds.credentials, _secret(), algorithms=[_ALG])
+        jti = payload.get("jti")
+        if jti:
+            revoke(jti)
+            logger.info(f"[auth] token revoked jti={jti[:8]}... sub={payload.get('sub','?')[:8]}...")
+    except jwt.InvalidTokenError:
+        pass  # already invalid — revocation is a no-op
+    return {"message": "Logged out successfully."}
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
