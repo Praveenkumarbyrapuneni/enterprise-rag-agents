@@ -218,9 +218,17 @@ def _evaluate(state: RAGState) -> tuple[float, float, str]:
     Run both evaluation layers. Returns (faithfulness, relevance, reason).
     Never raises — always returns scores the graph can act on.
     """
-    question = (state.get("question") or "").strip()
-    answer   = (state.get("answer")   or "").strip()
-    chunks   = state.get("chunks") or []
+    question    = (state.get("question")    or "").strip()
+    answer      = (state.get("answer")      or "").strip()
+    chunks      = state.get("chunks") or []
+    data_source = state.get("data_source", "rag")
+
+    # ── SQL path: data comes directly from the database — no hallucination possible ──
+    # Skip LLM judge entirely. Score 1.0/1.0 if we got a result, 0/0 if empty.
+    if data_source == "sql":
+        if not answer.strip() or answer.strip() == _CANNOT_ANSWER.strip():
+            return 0.0, 0.0, "empty sql result"
+        return 1.0, 1.0, "direct database lookup — no hallucination possible"
 
     # ── Layer 1: deterministic ─────────────────────────────────────────────────
     faith, rel, reason = _deterministic_check(answer, chunks)

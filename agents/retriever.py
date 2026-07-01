@@ -44,6 +44,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from .logger import get_logger
 from .state import RAGState, RetrievedChunk
@@ -118,7 +119,24 @@ def _embed_query(text: str) -> list[float]:
 # ── Step 2: Qdrant dense vector search ───────────────────────────────────────
 
 
-def _search_qdrant(vector: list[float], top_k: int) -> list[dict]:
+def _build_tenant_filter(tenant_id: str) -> Filter | None:
+    """
+    Build a Qdrant payload filter that restricts search to one tenant.
+    Returns None only when tenant_id is empty (dev/test without isolation).
+    In production, tenant_id is always set — an empty tenant_id is a bug.
+    """
+    if not tenant_id:
+        logger.warning(
+            "[retriever] tenant_id is empty — searching ALL tenants. "
+            "This must never happen in production."
+        )
+        return None
+    return Filter(
+        must=[FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id))]
+    )
+
+
+def _search_qdrant(vector: list[float], top_k: int, tenant_filter: Filter | None = None) -> list[dict]:
     """
     Dense vector search. Returns payload + stored vector per hit.
     with_vectors=True fetches stored vectors for MMR cosine similarity — no
@@ -142,6 +160,7 @@ def _search_qdrant(vector: list[float], top_k: int) -> list[dict]:
                 collection_name=_COLLECTION,
                 query=vector,
                 limit=top_k,
+                query_filter=tenant_filter,
                 with_payload=True,
                 with_vectors=True,
             ).points
@@ -298,7 +317,7 @@ def _fetch_parents(parent_ids: list[str]) -> dict[str, str]:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT parent_id::text, text FROM parent_chunks "
-                    "WHERE parent_id = ANY(%s)",
+                    "WHERE parent_id = ANY(%s::uuid[])",
                     (parent_ids,),
                 )
                 return {str(row[0]): row[1] for row in cur.fetchall()}
@@ -340,14 +359,22 @@ def _to_chunks(candidates: list[dict], parent_texts: dict[str, str]) -> list[Ret
 
 def retrieve(state: RAGState) -> RAGState:
     """
-    LangGraph node: fills state["chunks"] from Qdrant.
+    LangGraph node: fills state["chunks"] from Qdrant, filtered to tenant_id.
 
-    Reads:  state["question"], state["hyde_query"]
+    Reads:  state["question"], state["hyde_query"], state["tenant_id"]
     Writes: state["chunks"], state["error"]
+
+    Tenant isolation: every Qdrant search includes a payload filter on tenant_id.
+    A missing or empty tenant_id logs a critical warning — it means isolation is broken.
     """
-    question = (state.get("question") or "").strip()
+    question  = (state.get("question")  or "").strip()
+    tenant_id = (state.get("tenant_id") or "").strip()
+
     if not question:
         return {**state, "error": "retrieve: question is empty"}
+
+    # Build tenant filter — applied to EVERY Qdrant search in this call
+    tenant_filter = _build_tenant_filter(tenant_id)
 
     try:
         # ── Embed ─────────────────────────────────────────────────────────────
@@ -359,16 +386,15 @@ def retrieve(state: RAGState) -> RAGState:
             vectors.append(_embed_query(hyde_query))
 
         # For comparative/multi_company: search with each sub-question independently.
-        # The reranker then picks the best chunks across all of them.
         for sq in (state.get("sub_questions") or []):
             if sq.strip():
                 vectors.append(_embed_query(sq.strip()))
 
-        # ── Search (deduplicated union across all query vectors) ───────────────
+        # ── Search (deduplicated union, tenant-filtered) ──────────────────────
         seen_ids: set[str] = set()
         candidates: list[dict] = []
         for vec in vectors:
-            for hit in _search_qdrant(vec, _QDRANT_TOP_K):
+            for hit in _search_qdrant(vec, _QDRANT_TOP_K, tenant_filter):
                 if hit["id"] not in seen_ids:
                     seen_ids.add(hit["id"])
                     candidates.append(hit)

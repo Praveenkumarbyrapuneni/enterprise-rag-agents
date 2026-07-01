@@ -75,24 +75,28 @@ def _get_bedrock():
 # Few-shot examples cover every query type so Haiku doesn't mis-classify.
 # HyDE rule: write in financial document language, NEVER include specific dollar
 # amounts or percentages (hallucination risk on numerical queries).
-_SYSTEM = """You are a financial document query analyzer. Analyze the user query and return ONLY a valid JSON object, no explanation.
+_SYSTEM = """You are a financial query analyzer. Analyze the user query and return ONLY a valid JSON object, no explanation.
 
 Query types:
-- "numerical"    : asks for specific numbers, dollar amounts, percentages, ratios
-- "conceptual"   : asks how/why, about strategy, risk, outlook, operations
-- "comparative"  : compares two or more entities, metrics, or time periods
-- "temporal"     : asks about trends or changes over time for a single entity
+- "sql"          : needs ONLY live account data — balance, transactions, spending totals, flagged charges
+- "hybrid"       : needs BOTH live account data AND document knowledge — e.g. "why was I charged X fee" (needs transaction record + fee policy doc)
+- "numerical"    : asks for specific numbers, dollar amounts, percentages, ratios from documents
+- "conceptual"   : asks how/why, about strategy, risk, outlook, operations (documents only)
+- "comparative"  : compares two or more entities, metrics, or time periods (documents only)
+- "temporal"     : asks about trends or changes over time for a single entity (documents only)
 - "regulatory"   : asks about specific regulations, compliance terms (LIBOR, SOX, Basel)
 - "multi_company": mentions multiple different companies without direct comparison framing
 - "general"      : everything else
 
 Rules (MUST follow exactly):
-1. hyde_applicable=true ONLY for "conceptual" and "temporal" query types
-2. HyDE text must be written in financial document language (analyst/10-K style)
-3. HyDE text must NEVER contain specific dollar amounts or percentages — write qualitatively
-4. needs_decomposition=true ONLY for "comparative" and "multi_company" (2+ distinct entities)
-5. sub_questions: 2-4 self-contained questions, one per entity or distinct aspect
-6. sub_questions must be [] and needs_decomposition must be false for all other types
+1. Use "sql" for: balance, account total, recent transactions, spending, flagged charges — no document search needed
+2. Use "hybrid" for: explain a charge, why was I charged, compare my transaction to policy — needs BOTH data sources
+3. hyde_applicable=true ONLY for "conceptual" and "temporal" query types
+4. HyDE text must be written in financial document language (analyst/10-K style)
+5. HyDE text must NEVER contain specific dollar amounts or percentages — write qualitatively
+6. needs_decomposition=true ONLY for "comparative" and "multi_company" (2+ distinct entities)
+7. sub_questions: 2-4 self-contained questions, one per entity or distinct aspect
+8. sub_questions must be [] and needs_decomposition must be false for all other types
 
 Return this exact JSON structure:
 {
@@ -104,6 +108,21 @@ Return this exact JSON structure:
 }"""
 
 _EXAMPLES = """Examples:
+
+Query: "What is my current balance?"
+{"query_type":"sql","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
+
+Query: "Show me my last 5 transactions"
+{"query_type":"sql","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
+
+Query: "Do I have any flagged or suspicious transactions?"
+{"query_type":"sql","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
+
+Query: "Why was I charged a foreign transaction fee on June 26?"
+{"query_type":"hybrid","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
+
+Query: "Explain the $340 charge from FX Merchant and whether it complies with our fee policy"
+{"query_type":"hybrid","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
 
 Query: "What was Apple's iPhone revenue in Q3 2024?"
 {"query_type":"numerical","needs_decomposition":false,"sub_questions":[],"hyde_applicable":false,"hyde_query":""}
@@ -174,7 +193,7 @@ def _call_haiku(question: str) -> dict:
 # ── Output validation ─────────────────────────────────────────────────────────
 
 _VALID_TYPES = {"numerical", "conceptual", "comparative", "temporal",
-                "regulatory", "multi_company", "general"}
+                "regulatory", "multi_company", "general", "sql", "hybrid"}
 
 
 def _validate(raw: dict, question: str) -> dict:
@@ -275,17 +294,27 @@ def analyze_query(state: RAGState) -> RAGState:
         logger.error(f"[analyzer] Unexpected error: {type(e).__name__}: {e}")
         result = _fallback(question)
 
+    # Derive data_source from query_type so graph can route correctly
+    query_type = result["query_type"]
+    if query_type == "sql":
+        data_source = "sql"
+    elif query_type == "hybrid":
+        data_source = "hybrid"
+    else:
+        data_source = "rag"
+
     logger.info(
-        f"[analyzer] type={result['query_type']} "
+        f"[analyzer] type={query_type} data_source={data_source} "
         f"sub_questions={len(result['sub_questions'])} "
         f"hyde={'yes' if result['hyde_query'] else 'no'}"
     )
 
     return {
         **state,
-        "query_type":   result["query_type"],
+        "query_type":    query_type,
         "sub_questions": result["sub_questions"],
-        "hyde_query":   result["hyde_query"],
+        "hyde_query":    result["hyde_query"],
+        "data_source":   data_source,
     }
 
 

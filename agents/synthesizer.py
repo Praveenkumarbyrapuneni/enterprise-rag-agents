@@ -53,12 +53,13 @@ logger = get_logger(__name__)
 
 _SONNET_MODEL  = os.getenv(
     "BEDROCK_SONNET_MODEL_ID",
-    "us.anthropic.claude-sonnet-4-6-20261001-v1:0",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
 )
 _MAX_TOKENS    = 1024     # 200-500 word answer = 300-700 tokens; 1024 gives headroom
 _TIMEOUT_S     = 45       # Sonnet + long context is slower than Haiku
 _MAX_CHUNK_LEN = 3000     # characters per chunk in the prompt (parent chunks can be long)
-_CANNOT_ANSWER = "I cannot find this information in the available documents."
+_CANNOT_ANSWER     = "I cannot find this information in the available documents."
+_CANNOT_ANSWER_SQL = "I cannot find this information in your transaction records."
 
 _bedrock_client: Optional[object] = None
 
@@ -109,6 +110,28 @@ STRICT RULES — follow all of them exactly:
 7. Do not combine information from different companies without making it explicit which company each figure belongs to."""
 
 _CANNOT_ANSWER_LOWER = _CANNOT_ANSWER.lower()
+
+
+def _build_hybrid_prompt(question: str, sql_result: str, chunks: list[RetrievedChunk]) -> str:
+    """
+    For hybrid queries: combine live transaction data + document chunks into one prompt.
+    Claude synthesizes both sources into one grounded answer.
+    """
+    context_parts = []
+    for i, chunk in enumerate(chunks, start=1):
+        text = (chunk["text"] or "").strip()
+        if len(text) > _MAX_CHUNK_LEN:
+            text = text[:_MAX_CHUNK_LEN] + "... [truncated]"
+        context_parts.append(
+            f"[Document Chunk #{i}] Source: {chunk['source']}, page {chunk['page']}\n{text}"
+        )
+    doc_context = "\n\n".join(context_parts)
+    return (
+        f"LIVE TRANSACTION DATA (from account database):\n{sql_result}\n\n"
+        f"POLICY / DOCUMENT CONTEXT:\n{doc_context}\n\n"
+        f"QUESTION: {question}\n\n"
+        "ANSWER (cite document chunks inline using [Source: filename, page N, Chunk #K]):"
+    )
 
 
 def _build_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
@@ -201,15 +224,102 @@ def _validate_answer(answer: str) -> None:
 
 def synthesize(state: RAGState) -> RAGState:
     """
-    LangGraph node: write a grounded answer from the retrieved chunks.
+    LangGraph node: write a grounded answer from chunks and/or sql_result.
 
-    Reads:  state["question"], state["chunks"]
+    Reads:  state["question"], state["chunks"], state["sql_result"], state["data_source"]
     Writes: state["answer"], state["sources"], state["error"]
-    """
-    question = (state.get("question") or "").strip()
-    chunks   = state.get("chunks") or []
 
-    # Guard: no chunks → return "cannot answer" without calling Claude
+    Three paths:
+      sql    → format sql_result directly (no Claude call, no hallucination possible)
+      rag    → existing behavior: Claude synthesizes from document chunks
+      hybrid → Claude synthesizes from BOTH sql_result and document chunks
+    """
+    question    = (state.get("question")    or "").strip()
+    data_source = (state.get("data_source") or "rag")
+    sql_result  = state.get("sql_result")
+    chunks      = state.get("chunks") or []
+
+    # ── SQL-only: format database result directly — no Claude needed ──────────
+    if data_source == "sql":
+        if not sql_result:
+            logger.warning("[synthesizer] sql data_source but sql_result is empty")
+            return {
+                **state,
+                "answer":  _CANNOT_ANSWER_SQL,
+                "sources": [],
+                "error":   None,
+            }
+        logger.info(f"[synthesizer] sql path — {len(sql_result)} chars from DB")
+        return {
+            **state,
+            "answer":  sql_result,
+            "sources": ["Live transaction database"],
+            "error":   None,
+        }
+
+    # ── Hybrid: Claude combines sql_result + document chunks ──────────────────
+    if data_source == "hybrid":
+        usable = [c for c in chunks if (c.get("text") or "").strip()]
+        if not sql_result and not usable:
+            return {
+                **state,
+                "answer":  _CANNOT_ANSWER,
+                "sources": [],
+                "error":   None,
+            }
+        # If only sql_result (no chunks retrieved), treat as sql path
+        if not usable and sql_result:
+            return {
+                **state,
+                "answer":  sql_result,
+                "sources": ["Live transaction database"],
+                "error":   None,
+            }
+        # Both available — Claude synthesizes
+        if not sql_result:
+            sql_result = "No live transaction data available for this query."
+
+        try:
+            ordered = _reorder_chunks(usable)
+            user_message = _build_hybrid_prompt(question, sql_result, ordered)
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": _MAX_TOKENS,
+                "system": _SYSTEM,
+                "messages": [{"role": "user", "content": user_message}],
+            })
+            response = _get_bedrock().invoke_model(
+                modelId=_SONNET_MODEL,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            result = json.loads(response["body"].read())
+            answer  = result["content"][0]["text"].strip()
+            sources = _extract_sources(answer)
+            if "Live transaction database" not in sources:
+                sources = ["Live transaction database"] + sources
+            _validate_answer(answer)
+            logger.info(f"[synthesizer] hybrid path — {len(answer)} chars, {len(sources)} sources")
+            return {**state, "answer": answer, "sources": sources, "error": None}
+
+        except ClientError as e:
+            msg = f"synthesize: Bedrock {e.response['Error']['Code']}: {e}"
+            logger.error(f"[synthesizer] hybrid failed: {msg}")
+            # Graceful degradation: return just the sql_result
+            return {
+                **state,
+                "answer":  f"{sql_result}\n\n(Document context unavailable due to service error.)",
+                "sources": ["Live transaction database"],
+                "error":   msg,
+            }
+
+        except Exception as e:
+            msg = f"synthesize: unexpected error: {type(e).__name__}: {e}"
+            logger.error(f"[synthesizer] {msg}")
+            return {**state, "answer": sql_result, "sources": ["Live transaction database"], "error": msg}
+
+    # ── RAG-only: existing behavior (document chunks → Claude answer) ─────────
     usable = [c for c in chunks if (c.get("text") or "").strip()]
     if not usable:
         logger.warning("[synthesizer] No usable chunks — returning cannot-answer without LLM call")
@@ -227,7 +337,7 @@ def synthesize(state: RAGState) -> RAGState:
         _validate_answer(answer)
 
         logger.info(
-            f"[synthesizer] answer={len(answer)} chars "
+            f"[synthesizer] rag path — {len(answer)} chars "
             f"sources={len(sources)} "
             f"cannot_answer={'yes' if _CANNOT_ANSWER_LOWER in answer.lower() else 'no'}"
         )

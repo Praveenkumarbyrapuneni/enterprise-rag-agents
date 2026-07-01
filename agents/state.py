@@ -5,55 +5,71 @@ class RetrievedChunk(TypedDict):
     """One chunk returned from Qdrant, after reranking and MMR."""
     text: str
     score: float
-    source: str   # e.g. "Apple_10K_2024.pdf"
+    source: str   # e.g. "Apple_10K_2024.htm"
     page: int
     doc_id: str
 
 
 class RAGState(TypedDict):
     """
-    Shared state that flows through every agent node in the LangGraph pipeline.
+    Shared state flowing through every node in the LangGraph pipeline.
 
-    Query Analyzer  → fills: query_type, sub_questions, hyde_query
-    Retriever       → fills: chunks
-    Synthesizer     → fills: answer, sources
-    Evaluator       → fills: faithfulness, relevance, retry_count
+    Query Analyzer → fills: query_type, sub_questions, hyde_query, data_source
+    DB Lookup      → fills: sql_result           (sql / hybrid queries only)
+    Retriever      → fills: chunks               (rag / hybrid queries only)
+    Synthesizer    → fills: answer, sources
+    Evaluator      → fills: faithfulness, relevance
+    Graph          → manages: retry_count
     """
 
-    # ── Input ──────────────────────────────────────────────────────────────────
-    question: str
+    # ── Identity ───────────────────────────────────────────────────────────────
+    question:    str
+    tenant_id:   str   # "apple" | "goldman" | "jpmorgan" | "demo"
+    customer_id: str   # specific user within the tenant
 
     # ── Query Analyzer ─────────────────────────────────────────────────────────
-    query_type: str              # "risk" | "revenue" | "comparison" | "regulatory" | "general"
-    sub_questions: list[str]     # split sub-questions for multi-part queries
-    hyde_query: str              # hypothetical answer text used as the Qdrant search vector
+    query_type:    str          # "sql"|"hybrid"|"numerical"|"conceptual"|"comparative"|...
+    sub_questions: list[str]    # split questions for multi-entity queries
+    hyde_query:    str          # hypothetical answer for embedding-based search
+    data_source:   str          # "rag" | "sql" | "hybrid" — drives graph routing
 
-    # ── Retriever ──────────────────────────────────────────────────────────────
+    # ── DB Lookup (sql / hybrid only) ──────────────────────────────────────────
+    sql_result: Optional[str]  # formatted string from transactions table
+
+    # ── Retriever (rag / hybrid only) ──────────────────────────────────────────
     chunks: list[RetrievedChunk]
 
     # ── Synthesizer ────────────────────────────────────────────────────────────
-    answer: str
-    sources: list[str]           # e.g. ["Apple 10-K 2024, page 14"]
+    answer:  str
+    sources: list[str]         # e.g. ["Apple 10-K, page 14, Chunk #2"]
 
     # ── Evaluator ──────────────────────────────────────────────────────────────
-    faithfulness: float          # RAGAS score — threshold 0.85
-    relevance: float             # RAGAS score — threshold 0.80
-    retry_count: int             # max 1 retry before returning best-effort answer
+    faithfulness: float        # threshold 0.85
+    relevance:    float        # threshold 0.80
+    retry_count:  int          # managed exclusively by graph.py
 
     # ── Error handling ─────────────────────────────────────────────────────────
     error: Optional[str]
 
 
-def initial_state(question: str) -> RAGState:
+def initial_state(
+    question: str,
+    tenant_id: str = "demo",
+    customer_id: str = "demo_user_001",
+) -> RAGState:
     """
-    Build a blank state with only the question set.
-    Every agent fills in its own fields; this ensures no KeyError on first access.
+    Build a blank state with only the question and tenant context set.
+    Every agent fills in its own fields; defaults prevent KeyError on first access.
     """
     return RAGState(
         question=question,
+        tenant_id=tenant_id,
+        customer_id=customer_id,
         query_type="",
         sub_questions=[],
         hyde_query="",
+        data_source="rag",
+        sql_result=None,
         chunks=[],
         answer="",
         sources=[],
@@ -65,8 +81,12 @@ def initial_state(question: str) -> RAGState:
 
 
 if __name__ == "__main__":
-    s = initial_state("What was Apple's iPhone revenue in Q3 2024?")
+    s = initial_state("What was Apple's iPhone revenue in Q3 2024?", tenant_id="apple")
     assert s["question"] == "What was Apple's iPhone revenue in Q3 2024?"
+    assert s["tenant_id"] == "apple"
+    assert s["customer_id"] == "demo_user_001"
+    assert s["data_source"] == "rag"
+    assert s["sql_result"] is None
     assert s["retry_count"] == 0
     assert s["chunks"] == []
     assert s["error"] is None

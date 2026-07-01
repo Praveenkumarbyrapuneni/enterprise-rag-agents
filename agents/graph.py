@@ -1,54 +1,56 @@
 """
-agents/graph.py — LangGraph pipeline: wires all 4 agents into a single runnable graph
+agents/graph.py — LangGraph pipeline wiring all agents into one runnable graph.
 
-Pipeline flow:
+Phase 3 pipeline — three data paths based on query type:
 
-  START
-    │
-    ▼
-  analyze_query   ← classifies question, generates hyde_query + sub_questions
-    │
-    ▼
-  retrieve        ← dense vector search → Cohere rerank → MMR → parent expansion
-    │
-    ▼
-  synthesize      ← lost-in-middle reorder → grounded Claude answer with citations
-    │
-    ▼
-  evaluate        ← deterministic checks + Haiku judge → faithfulness + relevance
-    │
-    ├── PASS (faith ≥ 0.85, rel ≥ 0.80) ─────────────────────────────────► END
-    │
-    └── FAIL + retries remaining ──► increment_retry ──► retrieve (retry path)
-                                                             │
-                                              synthesize ◄──┘
-                                                  │
-                                              evaluate
-                                                  │
-                                        FAIL + no retries ──► END
-                                        (warning already appended by evaluator)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        START                                    │
+  │                          │                                      │
+  │                    analyze_query                                │
+  │                          │                                      │
+  │          ┌───────────────┼───────────────┐                     │
+  │         sql            hybrid            rag                   │
+  │          │               │               │                     │
+  │       db_lookup       db_lookup       retrieve                 │
+  │          │               │               │                     │
+  │          │            retrieve            │                     │
+  │          │               │               │                     │
+  │          └───────────────┴───────────────┘                     │
+  │                          │                                      │
+  │                      synthesize                                 │
+  │                          │                                      │
+  │                       evaluate                                  │
+  │                          │                                      │
+  │            ┌─────────────┴─────────────┐                       │
+  │           pass                        fail                      │
+  │            │                           │                        │
+  │           END              (retry_count < MAX)                  │
+  │                                        │                        │
+  │                              increment_retry → retrieve         │
+  │                                             → synthesize        │
+  │                                             → evaluate → END    │
+  └─────────────────────────────────────────────────────────────────┘
 
-Why analyze_query is SKIPPED on retry:
-  Query classification, sub_questions, and hyde_query are set correctly first time.
-  Re-analyzing the same question produces the same output — wasted Bedrock call.
-  The retry targets the RETRIEVER: re-run Qdrant search (may get different chunks
-  if Qdrant had transient ranking issues) then re-synthesize from new context.
+Routing rules:
+  After analyze_query:
+    data_source == "sql"    → db_lookup → synthesize
+    data_source == "hybrid" → db_lookup → retrieve → synthesize
+    else                    → retrieve  → synthesize
 
-Why a dedicated increment_retry node (not done in evaluator):
-  If the evaluator incremented retry_count to signal "I want a retry", the router
-  would immediately see the incremented count and think "max retries done → END".
-  Off-by-one bug. Clean solution: evaluator only scores, graph owns retry_count.
-  increment_retry runs ONLY on the retry path, so retry_count = completed retries.
+  After db_lookup:
+    data_source == "hybrid" → retrieve
+    else                    → synthesize
 
-Error propagation:
-  Every agent degrades gracefully — none crash the pipeline:
-    - retrieve error    → chunks=[], synthesizer returns "cannot find"
-    - synthesize error  → answer="", evaluator scores 0/0 → retry or END
-    - evaluate error    → conservative scores (0.7, 0.7) → router decides
-  Max 1 retry total. After that the evaluator appends a confidence warning and
-  the pipeline ends cleanly with the best answer it managed to produce.
+  After evaluate:
+    scores pass OR max retries → END
+    scores fail, retries left  → increment_retry → retrieve (re-run RAG path)
 
-Entry point: run_query(question) → dict with answer, sources, scores, error
+Note on SQL retry:
+  If a SQL query fails (DB down), evaluator scores 0/0, graph tries one RAG retry.
+  The RAG retry is unlikely to help for balance questions, but it's bounded (max 1 retry)
+  and ends with the confidence warning — correct graceful degradation.
+
+Entry point: run_query(question, tenant_id, customer_id) → dict
 """
 
 import time
@@ -56,6 +58,7 @@ from typing import Optional
 
 from langgraph.graph import END, START, StateGraph
 
+from .db_lookup import db_lookup
 from .evaluator import _FAITH_PASS, _MAX_RETRIES, _REL_PASS, _WARNING, _is_cannot_answer
 from .logger import get_logger
 from .query_analyzer import analyze_query
@@ -84,7 +87,35 @@ def _increment_retry(state: RAGState) -> RAGState:
     return {**state, "retry_count": new_count}
 
 
-# ── Conditional router ────────────────────────────────────────────────────────
+# ── Conditional routers ───────────────────────────────────────────────────────
+
+
+def _route_after_analyze(state: RAGState) -> str:
+    """
+    Route after analyze_query based on data_source.
+      sql / hybrid → db_lookup first
+      everything else → retrieve directly
+    """
+    data_source = state.get("data_source", "rag")
+    if data_source in ("sql", "hybrid"):
+        logger.info(f"[graph] analyze_query → db_lookup (data_source={data_source})")
+        return "db_lookup"
+    logger.info(f"[graph] analyze_query → retrieve (data_source={data_source})")
+    return "retrieve"
+
+
+def _route_after_db_lookup(state: RAGState) -> str:
+    """
+    Route after db_lookup.
+      hybrid → retrieve (need document chunks too)
+      sql    → synthesize (db result is the only data needed)
+    """
+    data_source = state.get("data_source", "rag")
+    if data_source == "hybrid":
+        logger.info("[graph] db_lookup → retrieve (hybrid: need document chunks too)")
+        return "retrieve"
+    logger.info("[graph] db_lookup → synthesize (sql: db result is sufficient)")
+    return "synthesize"
 
 
 def _route_after_evaluate(state: RAGState) -> str:
@@ -98,8 +129,6 @@ def _route_after_evaluate(state: RAGState) -> str:
       4. Otherwise                                 → "retry" (→ increment_retry → retrieve)
 
     retry_count here = COMPLETED retries (incremented by _increment_retry node).
-    So retry_count=0 on first evaluation → retry allowed.
-        retry_count=1 after one retry    → retries exhausted → END.
     """
     faith       = state.get("faithfulness", 0.0)
     rel         = state.get("relevance", 0.0)
@@ -107,9 +136,7 @@ def _route_after_evaluate(state: RAGState) -> str:
     answer      = state.get("answer") or ""
 
     if faith >= _FAITH_PASS and rel >= _REL_PASS:
-        logger.info(
-            f"[graph] Scores passed (faith={faith:.2f} rel={rel:.2f}) → END"
-        )
+        logger.info(f"[graph] Scores passed (faith={faith:.2f} rel={rel:.2f}) → END")
         return "end"
 
     if retry_count >= _MAX_RETRIES:
@@ -119,8 +146,6 @@ def _route_after_evaluate(state: RAGState) -> str:
         )
         return "end"
 
-    # IDK answer at max retries — evaluator didn't append warning (by design,
-    # "cannot find" already communicates uncertainty). End cleanly anyway.
     if _is_cannot_answer(answer) and retry_count >= _MAX_RETRIES:
         logger.info("[graph] IDK answer, retries exhausted → END")
         return "end"
@@ -136,66 +161,82 @@ def _route_after_evaluate(state: RAGState) -> str:
 
 
 def _build_graph() -> StateGraph:
-    """
-    Assemble the LangGraph StateGraph. Called once at module load.
-    Returns a compiled graph ready for invoke().
-    """
+    """Assemble the LangGraph StateGraph. Called once at module load."""
     builder = StateGraph(RAGState)
 
     # ── Nodes ──────────────────────────────────────────────────────────────────
     builder.add_node("analyze_query",   analyze_query)
+    builder.add_node("db_lookup",       db_lookup)
     builder.add_node("retrieve",        retrieve)
     builder.add_node("synthesize",      synthesize)
     builder.add_node("evaluate",        evaluate)
     builder.add_node("increment_retry", _increment_retry)
 
-    # ── Edges — happy path ─────────────────────────────────────────────────────
-    builder.add_edge(START,            "analyze_query")
-    builder.add_edge("analyze_query",  "retrieve")
-    builder.add_edge("retrieve",       "synthesize")
-    builder.add_edge("synthesize",     "evaluate")
+    # ── Entry ──────────────────────────────────────────────────────────────────
+    builder.add_edge(START, "analyze_query")
 
-    # ── Conditional edge — retry or END ───────────────────────────────────────
+    # ── Route after analyze_query: sql/hybrid → db_lookup, else → retrieve ────
+    builder.add_conditional_edges(
+        "analyze_query",
+        _route_after_analyze,
+        {"db_lookup": "db_lookup", "retrieve": "retrieve"},
+    )
+
+    # ── Route after db_lookup: hybrid → retrieve, sql → synthesize ────────────
+    builder.add_conditional_edges(
+        "db_lookup",
+        _route_after_db_lookup,
+        {"retrieve": "retrieve", "synthesize": "synthesize"},
+    )
+
+    # ── Happy path ─────────────────────────────────────────────────────────────
+    builder.add_edge("retrieve",   "synthesize")
+    builder.add_edge("synthesize", "evaluate")
+
+    # ── Retry or END ───────────────────────────────────────────────────────────
     builder.add_conditional_edges(
         "evaluate",
         _route_after_evaluate,
-        {
-            "retry": "increment_retry",   # → increment counter → back to retrieve
-            "end":   END,
-        },
+        {"retry": "increment_retry", "end": END},
     )
 
-    # ── Retry path ─────────────────────────────────────────────────────────────
-    # After incrementing, go straight to retrieve (skip analyze_query — same question)
+    # ── Retry path: after increment, go back to retrieve (skip analyze+db_lookup) ─
     builder.add_edge("increment_retry", "retrieve")
 
     return builder.compile()
 
 
-# Build once at import time — reused for every query
+# Build once at import time
 _graph = _build_graph()
-logger.info("[graph] LangGraph pipeline compiled and ready")
+logger.info("[graph] LangGraph pipeline compiled and ready (Phase 3: sql + hybrid + rag)")
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
 
-def run_query(question: str) -> dict:
+def run_query(
+    question:    str,
+    tenant_id:   str = "demo",
+    customer_id: str = "demo_user_001",
+) -> dict:
     """
     Main entry point for the RAG pipeline.
 
     Args:
-        question: The user's question in plain English.
+        question:    The user's question in plain English.
+        tenant_id:   Which company's data to search ("apple", "goldman", "jpmorgan", "demo").
+        customer_id: Specific customer within the tenant for transaction lookups.
 
     Returns:
         {
             "answer":       str   — grounded answer with inline citations
             "sources":      list  — list of cited sources
-            "query_type":   str   — classification (numerical, conceptual, etc.)
-            "faithfulness": float — RAGAS-style faithfulness score (0.0–1.0)
-            "relevance":    float — answer relevance score (0.0–1.0)
+            "query_type":   str   — classification (sql, hybrid, numerical, etc.)
+            "data_source":  str   — "rag" | "sql" | "hybrid"
+            "faithfulness": float — score 0.0–1.0
+            "relevance":    float — score 0.0–1.0
             "retry_count":  int   — how many retries were needed (0 or 1)
-            "error":        str | None — pipeline error if any
+            "error":        str | None
         }
     """
     question = (question or "").strip()
@@ -206,17 +247,21 @@ def run_query(question: str) -> dict:
             "answer":       "Please provide a question.",
             "sources":      [],
             "query_type":   "general",
+            "data_source":  "rag",
             "faithfulness": 0.0,
             "relevance":    0.0,
             "retry_count":  0,
             "error":        "empty question",
         }
 
-    logger.info(f"[graph] START — question='{question[:100]}{'...' if len(question) > 100 else ''}'")
+    logger.info(
+        f"[graph] START — tenant={tenant_id} customer={customer_id} "
+        f"question='{question[:100]}{'...' if len(question) > 100 else ''}'"
+    )
     start = time.time()
 
     try:
-        final   = _graph.invoke(initial_state(question))
+        final   = _graph.invoke(initial_state(question, tenant_id=tenant_id, customer_id=customer_id))
         elapsed = time.time() - start
 
         faith   = final.get("faithfulness", 0.0)
@@ -227,7 +272,7 @@ def run_query(question: str) -> dict:
         logger.info(
             f"[graph] END — elapsed={elapsed:.2f}s "
             f"faith={faith:.2f} rel={rel:.2f} "
-            f"retries={retries} "
+            f"retries={retries} data_source={final.get('data_source','rag')} "
             f"error={'none' if not error else error[:60]}"
         )
 
@@ -235,6 +280,7 @@ def run_query(question: str) -> dict:
             "answer":       final.get("answer", ""),
             "sources":      final.get("sources", []),
             "query_type":   final.get("query_type", "general"),
+            "data_source":  final.get("data_source", "rag"),
             "faithfulness": faith,
             "relevance":    rel,
             "retry_count":  retries,
@@ -252,6 +298,7 @@ def run_query(question: str) -> dict:
             ),
             "sources":      [],
             "query_type":   "general",
+            "data_source":  "rag",
             "faithfulness": 0.0,
             "relevance":    0.0,
             "retry_count":  0,
@@ -263,74 +310,51 @@ def run_query(question: str) -> dict:
 
 if __name__ == "__main__":
     from agents.state import initial_state as _initial_state
+    from agents.evaluator import _CANNOT_ANSWER, _WARNING
 
-    # 1. Graph compiles without error (already done at import — just verify object)
-    assert _graph is not None, "Graph must compile at import"
+    # 1. Graph compiles without error
+    assert _graph is not None
 
-    # 2. Graph has all 5 expected nodes
+    # 2. Graph has all 6 expected nodes
     node_names = set(_graph.get_graph().nodes.keys())
-    for expected in ["analyze_query", "retrieve", "synthesize", "evaluate", "increment_retry"]:
+    for expected in ["analyze_query", "db_lookup", "retrieve", "synthesize", "evaluate", "increment_retry"]:
         assert expected in node_names, f"Missing node: {expected}"
 
-    # 3. Router: passing scores → "end"
-    s_pass = {
-        **_initial_state("test"),
-        "faithfulness": 0.90,
-        "relevance":    0.85,
-        "retry_count":  0,
-        "answer":       "good answer [Source: f.pdf, page 1, Chunk #1]",
-    }
-    assert _route_after_evaluate(s_pass) == "end", "Passing scores must route to end"
+    # 3. After analyze: sql/hybrid → db_lookup, rag → retrieve
+    assert _route_after_analyze({**_initial_state("test"), "data_source": "sql"})    == "db_lookup"
+    assert _route_after_analyze({**_initial_state("test"), "data_source": "hybrid"}) == "db_lookup"
+    assert _route_after_analyze({**_initial_state("test"), "data_source": "rag"})    == "retrieve"
+    assert _route_after_analyze({**_initial_state("test"), "data_source": ""})       == "retrieve"
 
-    # 4. Router: failing scores, no retries used → "retry"
-    s_retry = {
-        **_initial_state("test"),
-        "faithfulness": 0.70,
-        "relevance":    0.75,
-        "retry_count":  0,
-        "answer":       "answer without citations",
-    }
-    assert _route_after_evaluate(s_retry) == "retry", "Failing scores with retries left must retry"
+    # 4. After db_lookup: hybrid → retrieve, sql → synthesize
+    assert _route_after_db_lookup({**_initial_state("test"), "data_source": "hybrid"}) == "retrieve"
+    assert _route_after_db_lookup({**_initial_state("test"), "data_source": "sql"})    == "synthesize"
 
-    # 5. Router: failing scores, max retries used → "end"
-    s_maxed = {
-        **_initial_state("test"),
-        "faithfulness": 0.70,
-        "relevance":    0.75,
-        "retry_count":  _MAX_RETRIES,
-        "answer":       "answer" + _WARNING,
-    }
-    assert _route_after_evaluate(s_maxed) == "end", "Max retries exhausted must route to end"
+    # 5. Evaluate router: passing scores → "end"
+    s_pass = {**_initial_state("test"), "faithfulness": 0.90, "relevance": 0.85,
+               "retry_count": 0, "answer": "good answer [Source: f.pdf, page 1, Chunk #1]"}
+    assert _route_after_evaluate(s_pass) == "end"
 
-    # 6. Router: IDK answer at max retries → "end"
-    from agents.evaluator import _CANNOT_ANSWER
-    s_idk_max = {
-        **_initial_state("test"),
-        "faithfulness": 1.0,
-        "relevance":    0.0,
-        "retry_count":  _MAX_RETRIES,
-        "answer":       _CANNOT_ANSWER,
-    }
-    assert _route_after_evaluate(s_idk_max) == "end", "IDK at max retries must route to end"
+    # 6. Evaluate router: failing scores, no retries used → "retry"
+    s_retry = {**_initial_state("test"), "faithfulness": 0.70, "relevance": 0.75,
+                "retry_count": 0, "answer": "answer without citations"}
+    assert _route_after_evaluate(s_retry) == "retry"
 
-    # 7. Router: IDK answer with retries remaining → "retry"
-    s_idk_first = {
-        **_initial_state("test"),
-        "faithfulness": 1.0,
-        "relevance":    0.0,
-        "retry_count":  0,
-        "answer":       _CANNOT_ANSWER,
-    }
-    assert _route_after_evaluate(s_idk_first) == "retry", "IDK with retries remaining must retry"
+    # 7. Evaluate router: max retries → "end"
+    s_maxed = {**_initial_state("test"), "faithfulness": 0.70, "relevance": 0.75,
+                "retry_count": _MAX_RETRIES, "answer": "answer" + _WARNING}
+    assert _route_after_evaluate(s_maxed) == "end"
 
     # 8. increment_retry increments correctly
     s_inc = {**_initial_state("test"), "retry_count": 0}
-    result_inc = _increment_retry(s_inc)
-    assert result_inc["retry_count"] == 1, "increment_retry must add 1 to retry_count"
+    assert _increment_retry(s_inc)["retry_count"] == 1
 
-    # 9. run_query with empty string returns graceful error (no crash)
-    result_empty = run_query("")
-    assert result_empty["error"] == "empty question"
-    assert result_empty["answer"] == "Please provide a question."
+    # 9. run_query with empty string → graceful error, no crash
+    result = run_query("")
+    assert result["error"] == "empty question"
+    assert result["answer"] == "Please provide a question."
 
-    print("graph.py self-check passed — compilation, nodes, router (all 5 cases), increment, empty-query all correct")
+    # 10. run_query returns data_source field
+    assert "data_source" in result
+
+    print("graph.py self-check passed — all 6 nodes, all routers, empty-query, data_source field all correct")

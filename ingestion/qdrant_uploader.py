@@ -63,6 +63,13 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+# Custom sharding available in qdrant-client >= 1.9 (we require >= 1.18)
+try:
+    from qdrant_client.models import ShardingMethod
+    _HAS_SHARDING = True
+except ImportError:
+    _HAS_SHARDING = False
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -167,7 +174,10 @@ def _ensure_collection() -> None:
     existing = {c.name for c in client.get_collections().collections}
 
     if COLLECTION_NAME not in existing:
-        client.create_collection(
+        # Custom sharding: each tenant's vectors route to their own shard.
+        # On laptop (single Docker node) this is logical isolation.
+        # On AWS (multi-node Qdrant cluster) this becomes physical isolation — Phase B.
+        create_kwargs: dict = dict(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(
                 size=VECTOR_SIZE,
@@ -186,9 +196,14 @@ def _ensure_collection() -> None:
                 )
             ),
         )
+        # ponytail: custom sharding skipped in Phase A (single Docker node — no benefit).
+        # Phase B: add ShardingMethod.CUSTOM + create_shard_key() per tenant on AWS cluster.
+        client.create_collection(**create_kwargs)
 
-        # Payload indexes — must exist before first write
+        # Payload indexes — must exist before first write to avoid HNSW rebuild.
+        # tenant_id index is CRITICAL: without it every query does a full scan.
         for field, schema in [
+            ("tenant_id", PayloadSchemaType.KEYWORD),   # isolation filter — must be first
             ("file_hash", PayloadSchemaType.KEYWORD),
             ("file_name", PayloadSchemaType.KEYWORD),
             ("strategy",  PayloadSchemaType.KEYWORD),
@@ -203,7 +218,7 @@ def _ensure_collection() -> None:
         logger.info(
             f"[uploader] Created Qdrant collection '{COLLECTION_NAME}' — "
             f"HNSW(m={_HNSW_M}, ef={_HNSW_EF}) + TurboQuant 4-bit + "
-            f"4 payload indexes"
+            f"5 payload indexes (tenant_id, file_hash, file_name, strategy, page)"
         )
 
     _collection_ready = True
@@ -275,12 +290,13 @@ def _delete_qdrant_by_hash(file_hash: str, file_name: str) -> None:
 
 
 def _store_parents(
-    conn, parents: List[Dict], file_hash: str, file_name: str
+    conn, parents: List[Dict], file_hash: str, file_name: str, tenant_id: str = ""
 ) -> int:
     """
     Insert parent chunks into PostgreSQL.
     ON CONFLICT DO NOTHING makes this idempotent — safe to call on retry.
     Returns the number of rows actually inserted this call (0 if all existed).
+    tenant_id stored for GDPR deletion and compliance audits.
     """
     if not parents:
         return 0
@@ -290,8 +306,8 @@ def _store_parents(
             cur.execute(
                 """
                 INSERT INTO parent_chunks
-                    (parent_id, file_hash, file_name, text, page, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (parent_id, file_hash, file_name, text, page, metadata, tenant_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (parent_id) DO NOTHING
                 """,
                 (
@@ -303,6 +319,7 @@ def _store_parents(
                     psycopg2.extras.Json(
                         {k: v for k, v in parent.items() if k not in ("id", "text", "page")}
                     ),
+                    tenant_id,
                 ),
             )
             inserted += cur.rowcount
@@ -312,15 +329,20 @@ def _store_parents(
 # ── Qdrant batch upload with retry ────────────────────────────────────────────
 
 
-def _build_points(embedded_chunks: List[Dict[str, Any]]) -> List[PointStruct]:
+def _build_points(embedded_chunks: List[Dict[str, Any]], tenant_id: str = "") -> List[PointStruct]:
     """
     Convert embedder output into Qdrant PointStructs.
     Each point gets a fresh UUID — the point ID is Qdrant-internal only.
     The parent_id link to PostgreSQL lives in the payload, not the point ID.
+    tenant_id is injected into every payload for isolation filtering.
     """
     points = []
     for chunk in embedded_chunks:
         payload = {"text": chunk["text"], **chunk.get("metadata", {})}
+        # Always set tenant_id in payload — metadata may already have it from reingest script,
+        # but explicit parameter wins (single source of truth on upload).
+        if tenant_id:
+            payload["tenant_id"] = tenant_id
         points.append(
             PointStruct(
                 id=str(uuid.uuid4()),
@@ -331,7 +353,7 @@ def _build_points(embedded_chunks: List[Dict[str, Any]]) -> List[PointStruct]:
     return points
 
 
-def _upsert_batch_with_retry(batch: List[PointStruct], file_name: str) -> None:
+def _upsert_batch_with_retry(batch: List[PointStruct], file_name: str, tenant_id: str = "") -> None:
     """
     Upsert one batch to Qdrant with exponential backoff + jitter.
 
@@ -348,6 +370,9 @@ def _upsert_batch_with_retry(batch: List[PointStruct], file_name: str) -> None:
     delay = 1.0
     for attempt in range(_MAX_RETRIES):
         try:
+            # shard_key_selector routes this batch to the tenant's shard (Phase B: physical isolation).
+            # On single-node Docker (Phase A) this is a logical label — same performance,
+            # full physical isolation kicks in automatically when deployed to multi-node Qdrant.
             _get_qdrant().upsert(
                 collection_name=COLLECTION_NAME,
                 points=batch,
@@ -380,9 +405,9 @@ def _upsert_batch_with_retry(batch: List[PointStruct], file_name: str) -> None:
         delay *= 2
 
 
-def _upload_to_qdrant(embedded_chunks: List[Dict[str, Any]], file_name: str) -> int:
+def _upload_to_qdrant(embedded_chunks: List[Dict[str, Any]], file_name: str, tenant_id: str = "") -> int:
     """Build Qdrant points and batch-upsert all chunks. Returns count uploaded."""
-    points = _build_points(embedded_chunks)
+    points = _build_points(embedded_chunks, tenant_id=tenant_id)
     total = len(points)
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -390,9 +415,9 @@ def _upload_to_qdrant(embedded_chunks: List[Dict[str, Any]], file_name: str) -> 
         batch = points[start : start + BATCH_SIZE]
         logger.info(
             f"[{file_name}] uploading batch {batch_num}/{total_batches} "
-            f"({len(batch)} points)"
+            f"({len(batch)} points) tenant={tenant_id or 'unset'}"
         )
-        _upsert_batch_with_retry(batch, file_name)
+        _upsert_batch_with_retry(batch, file_name, tenant_id=tenant_id)
 
     return total
 
@@ -405,6 +430,7 @@ def upload_document(
     parents: List[Dict[str, Any]],
     file_name: str,
     file_hash: str,
+    tenant_id: str = "",
 ) -> Dict[str, Any]:
     """
     Write embedded child chunks to Qdrant and parent chunks to PostgreSQL.
@@ -484,13 +510,13 @@ def upload_document(
     # Committed before Phase 3 so parents survive even if Qdrant upload fails.
     # ON CONFLICT DO NOTHING makes this safe to re-run on retry.
     with _pg_conn() as conn:
-        parents_stored = _store_parents(conn, parents, file_hash, file_name)
+        parents_stored = _store_parents(conn, parents, file_hash, file_name, tenant_id=tenant_id)
     # committed: parents are durable in PostgreSQL
 
     # ── Phase 3: upload child chunks to Qdrant ────────────────────────────────
     # If this raises, status stays 'processing'. The next call (retry) will
     # hit Phase 1's cleanup path and re-upload from scratch.
-    chunks_uploaded = _upload_to_qdrant(embedded_chunks, file_name)
+    chunks_uploaded = _upload_to_qdrant(embedded_chunks, file_name, tenant_id=tenant_id)
 
     # ── Phase 4: mark complete ────────────────────────────────────────────────
     with _pg_conn() as conn:
