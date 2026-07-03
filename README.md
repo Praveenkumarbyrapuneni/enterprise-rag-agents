@@ -1,8 +1,12 @@
 # Enterprise RAG System
 
-A production-grade document intelligence system built for financial institutions.
+A production-grade document intelligence platform built for financial institutions.
 Users log in, ask questions in plain English, and get grounded answers from both
 their live transaction data and their institution's policy documents — with source citations.
+
+Retrieval uses **hybrid dense + BM25 sparse search** fused via Reciprocal Rank Fusion:
+dense vectors for semantic understanding, sparse vectors for exact financial term matching
+("SOFR rate", "Form 10-Q", specific clause numbers). Both run in a single Qdrant query.
 
 Designed to scale to 10M+ documents, millions of daily transactions, and millions of users.
 
@@ -73,9 +77,9 @@ A user from Institution A physically cannot retrieve Institution B's documents �
 ```
 Document comes in
       ↓
-Parse (PDF/Word/Excel/HTML/email) → Chunk (hierarchical) → Embed (Cohere v3)
+Parse (PDF/Word/Excel/HTML/email) → Chunk (hierarchical) → Embed (Cohere dense + BM25 sparse)
       ↓
-Store: vectors + tenant_id → Qdrant | parent chunks + tenant_id → PostgreSQL
+Store: dense vector + sparse vector + tenant_id → Qdrant | parent chunks → PostgreSQL
       ↓
 User logs in → JWT with tenant_id issued
       ↓
@@ -83,8 +87,9 @@ User asks a question
       ↓
 Query Analyzer (Claude Haiku) classifies: sql / rag / hybrid
       ↓
-  sql    → PostgreSQL transaction lookup
-  rag    → Qdrant vector search (tenant-filtered) → Cohere rerank → MMR dedup
+  sql    → PostgreSQL transaction lookup (exact data, no LLM synthesis)
+  rag    → Qdrant hybrid search (dense + BM25, RRF fusion, tenant-filtered)
+             → Cohere rerank → MMR dedup → parent context expansion
   hybrid → both paths combined
       ↓
 Synthesizer (Claude Sonnet) writes grounded answer with inline citations
@@ -101,13 +106,15 @@ Answer returned via FastAPI
 | Component | Technology |
 |---|---|
 | LLM | Claude Sonnet 4 + Haiku 4.5 via AWS Bedrock |
-| Embeddings | Cohere Embed v3 via Bedrock (1024 dims) |
-| Vector store | Qdrant — HNSW + TurboQuant 4-bit (8× smaller, ~1% recall loss) |
+| Dense embeddings | Cohere Embed v3 via Bedrock (1024 dims, `search_document` / `search_query` asymmetry) |
+| Sparse embeddings | BM25 (pure Python, zero new deps, djb2 hash, sublinear TF scaling) |
+| Retrieval fusion | Qdrant Prefetch + Reciprocal Rank Fusion (RRF) |
+| Vector store | Qdrant — HNSW m=16/ef=200 + TurboQuant 4-bit (8× smaller, ~1% recall loss) |
 | Metadata + transactions | PostgreSQL |
 | Task queue | Celery + Redis |
 | Agent framework | LangGraph (6-node pipeline) |
 | Re-ranking | Cohere Rerank v3 |
-| API | FastAPI — JWT auth, sliding-window rate limiting |
+| API | FastAPI — JWT auth, per-token revocation, sliding-window rate limiting |
 
 All AI calls go through AWS Bedrock. Data never leaves the VPC.
 
@@ -119,7 +126,7 @@ All AI calls go through AWS Bedrock. Data never leaves the VPC.
 
 ```bash
 # 1. Clone and install
-git clone <repo-url>
+git clone https://github.com/Praveenkumarbyrapuneni/enterprise-rag-agents.git
 cd enterprise-rag-agents
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

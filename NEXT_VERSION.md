@@ -148,46 +148,7 @@ the infrastructure cost.
 
 ---
 
-## 4. Hybrid Search (Dense + Sparse Vectors)
-
-**What it is:**
-
-Version 1 uses dense vector search — the query is embedded into a vector and
-Qdrant finds the nearest chunk vectors by cosine similarity. This is semantic
-search: it finds conceptually similar content even if the exact words differ.
-
-Dense search has a known weakness: exact keyword matching. If a user asks about
-"Section 4.2(b)" or "CUSIP 037833100" or a specific regulation code, the semantic
-vector for that query may not find the exact chunk that contains that string,
-because the model has never learned that this specific code is meaningful.
-
-Hybrid search combines:
-- **Dense vectors** (what we have) — semantic similarity
-- **Sparse vectors / BM25** — exact keyword matching, like a search engine
-
-The two scores are combined (reciprocal rank fusion) to produce a final ranking
-that handles both "find me content about revenue growth" and "find the exact
-clause numbered 4.2(b)."
-
-**Why not in Version 1:**
-
-Qdrant supports sparse vectors natively but requires a separate sparse vector
-index alongside the dense index. The ingestion pipeline must compute BM25 weights
-for every chunk at upload time. The retrieval agent must run two searches and
-fuse the results. This doubles retrieval complexity for a gain that only
-materialises on queries with specific identifiers or codes — which are a minority
-of financial queries but an important minority.
-
-**When to implement:**
-
-After RAGAS evaluation on Version 1. If context recall scores are low on
-queries that contain specific codes, clause numbers, or identifiers, add
-hybrid search. This is a targeted fix for a specific retrieval failure mode,
-not a general improvement.
-
----
-
-## 5. Live Transaction Streaming Pipeline
+## 4. Live Transaction Streaming Pipeline
 
 **What it is:**
 
@@ -458,7 +419,7 @@ about known definitions or company metadata — those are the OKF files to write
 | PDF vector graphics extraction | Users report missing chart data from specific PDF types |
 | Unlimited-OCR (self-hosted OCR) | Claude Vision API monthly cost exceeds GPU instance cost at production volume |
 | Late chunking | RAGAS recall fails systematically on documents with cross-reference language |
-| Hybrid search (dense + sparse) | RAGAS recall fails on queries with specific identifiers, codes, clause numbers |
+| ~~Hybrid search (dense + sparse)~~ | ✅ **IMPLEMENTED** — BM25 sparse vectors + RRF fusion (2026-07-03) |
 | Live transaction streaming | Phase B AWS deployment — after batch pipeline is stable |
 | Semantic chunking (optional) | Demand for processing single-topic academic / technical documents |
 | HNSW index tuning | RAGAS context recall drops below 0.80 at full 10M document scale |
