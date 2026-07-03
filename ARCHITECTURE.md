@@ -74,6 +74,7 @@ at 10M documents or millions of tenants, it is not used.
 ### Path 2 — RAG (document knowledge)
 **Triggers:** filing analysis, risk assessment, regulatory questions, strategy
 **Flow:** Query Analyzer → Retriever → Synthesizer (Claude) → Evaluator → retry?
+**Retriever internals:** dense Prefetch + BM25 sparse Prefetch → RRF fusion → Cohere rerank → MMR → parent expansion
 **Evaluator score:** LLM-as-judge on faithfulness + relevance
 
 ### Path 3 — Hybrid (live data + document knowledge)
@@ -96,12 +97,15 @@ Document file
       │                simple docs → fixed (512 tok)
       │                financial/complex → hierarchical (1024 parent / 256 child)
       ▼
-   Embedder            Cohere Embed v3 via AWS Bedrock → 1024-dim vectors
-      │                Haiku contextual enrichment per chunk (20 parallel workers)
+   Embedder            Step 1: Cohere Embed v3 via Bedrock → 1024-dim dense vector
+      │                         Haiku contextual enrichment (20 parallel workers)
+      │                Step 2: BM25 sparse vector from raw chunk text (pure Python)
+      │                         djb2 hash, sublinear TF scaling, no external deps
       ▼
    Qdrant Uploader     4-phase idempotent write:
       │                check → parents(PostgreSQL) → vectors(Qdrant) → mark complete
-      │                TurboQuant 4-bit: 8x memory compression, ~1% recall loss
+      │                Named vectors: "dense" (TurboQuant 4-bit) + "sparse" (BM25)
+      │                TurboQuant 4-bit on dense: 8x memory compression, ~1% recall loss
       ▼
    PostgreSQL           parent_chunks: full paragraph text for context expansion
                         ingestion_status: hash gate, deduplication

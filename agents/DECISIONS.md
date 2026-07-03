@@ -918,21 +918,38 @@ completes — it just returns slightly lower-quality results.
 Cohere's p50 latency is 100-400ms. A 12-second timeout catches genuine hangs
 while never triggering on normal slow responses.
 
-### Cohere Reranker Over BM25 Hybrid Search
+### BM25 Hybrid Search + Cohere Reranker — Both Active
 
-Common production RAG advice is to use hybrid search: dense vectors + BM25
-keyword scoring combined via Reciprocal Rank Fusion.
+The retrieval pipeline runs two complementary techniques in sequence:
 
-For this system, BM25 hybrid was evaluated and rejected for one reason: Cohere
-Embed v3 already encodes strong lexical information. Adding BM25 to a top-tier
-dense embedder adds noise, not signal, and increases latency.
+**Step 1 — Hybrid search (BM25 + dense, RRF fusion)**
 
-The Cohere Reranker provides a larger gain (30-48% precision improvement) with
-less complexity. The reranker receives all candidate chunks and re-scores them
-using a cross-encoder — a fundamentally different approach from BM25 fusion.
+Every query runs two Qdrant Prefetch searches simultaneously:
+- Dense: Cohere Embed v3 — semantic similarity ("explain revenue growth")
+- Sparse: BM25 (`ingestion/bm25.py`) — exact financial term matching
+  ("SOFR rate Q3 2024", "Form 10-Q Schedule 14A", specific clause numbers)
 
-BM25 hybrid remains planned for Phase B where full re-ingestion with sparse
-vector fields is feasible.
+Qdrant fuses both result sets via Reciprocal Rank Fusion (RRF) — no tuning
+parameter required. RRF combines rankings purely by position, not score magnitude.
+
+Why BM25 alongside a top-tier dense embedder: Cohere Embed v3 encodes strong
+semantic information. It encodes weak exact-term information. A query for "Basel
+III Tier 1 capital ratio 12.4%" will find conceptually similar chunks but may
+miss the chunk containing that exact string. BM25 finds it directly.
+
+**Step 2 — Cohere Reranker**
+
+After RRF fusion returns up to 40 candidates, Cohere Rerank v3 reads the full
+question and each candidate chunk as a cross-encoder — fundamentally different
+from embedding similarity. It re-scores all candidates by actual relevance and
+returns the top 8.
+
+The reranker adds 30-48% precision improvement on top of the hybrid search.
+It runs inside a ThreadPoolExecutor with a 12-second timeout — if Cohere's API
+hangs, retrieval falls back to raw RRF order (non-fatal).
+
+Both techniques are active as of 2026-07-03. The collection was re-ingested with
+named vector fields: `"dense"` (Cohere 1024-dim) + `"sparse"` (BM25 inverted index).
 
 ### MMR: lambda=0.6
 

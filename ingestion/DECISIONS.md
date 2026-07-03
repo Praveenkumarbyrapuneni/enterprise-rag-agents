@@ -5,6 +5,76 @@ including production issues discovered and how they were resolved.
 
 ---
 
+## BM25 Sparse Vectors
+
+### Pure Python Implementation — Zero New Dependencies
+
+BM25 sparse vector generation (`ingestion/bm25.py`) uses only Python stdlib —
+`math`, `re`, and `collections`. No `rank_bm25`, no `fastembed`, no `torch`.
+
+Rejected alternatives:
+- `fastembed` BM25: correct algorithm, but pulls in a 200MB torch-based model
+  download on first use. Incompatible with regulated environments that restrict
+  internet access from worker processes.
+- `rank_bm25`: requires fitting a BM25 model across the full corpus before
+  vectorizing any document — impossible in a streaming per-document ingestion
+  pipeline without a two-pass approach.
+
+The implementation uses term frequency (TF) with sublinear scaling `1 + log(tf)`,
+which is identical to Lucene/Elasticsearch's BM25 TF component. IDF (inverse
+document frequency) requires corpus-level statistics unavailable at per-document
+ingest time and is approximated by stopword removal instead.
+
+### djb2 Hash for Cross-Process Stable Token Indexing
+
+```python
+def _term_index(term: str) -> int:
+    h = 5381
+    for byte in term.encode():
+        h = ((h << 5) + h + byte) & 0xFFFFFFFF
+    return h % _VOCAB_SIZE   # 65,536 slots
+```
+
+Python's built-in `hash()` is seeded by `PYTHONHASHSEED` — different on every
+process start. Using it would produce different sparse vector indices across
+Celery workers, making sparse vectors from worker A incompatible with those from
+worker B.
+
+djb2 hash over UTF-8 bytes is deterministic across processes, Python versions,
+and operating systems. Every worker maps "revenue" to the same index every time.
+
+### BM25 on Raw Chunk Text, Not Enriched Text
+
+The embedder generates BM25 sparse vectors from the original chunk text, not
+from the Haiku-enriched text that gets dense-embedded.
+
+Reason: BM25 is for exact term matching. The Haiku enrichment adds context
+sentences like "This chunk describes Goldman Sachs Q3 2024 operating expenses."
+That context is valuable for dense embedding (semantic understanding) but
+introduces noise into BM25 — the enrichment phrases are not from the document
+and should not be keyword-matched against queries.
+
+Dense embedding uses enriched text. BM25 uses raw text. Both from the same chunk.
+
+### Qdrant Named Vector Collection — "dense" + "sparse"
+
+The Qdrant collection uses named vector fields rather than a single unnamed field:
+
+```python
+vectors_config={"dense": VectorParams(size=1024, distance=Distance.COSINE)},
+sparse_vectors_config={"sparse": SparseVectorParams(index=SparseIndexParams())}
+```
+
+This allows Qdrant's Prefetch API to search both fields independently and fuse
+the results via RRF in a single query call. The alternative (separate collections
+or separate queries) would double network round trips and break RRF's ability to
+see both result sets simultaneously.
+
+TurboQuant 4-bit compression applies to the dense field only. Sparse vectors are
+already compact by nature (most indices are zero — only non-zero terms stored).
+
+---
+
 ## Corpus Security
 
 ### Authenticated Ingest Only — BadRAG Corpus Poisoning Prevention
