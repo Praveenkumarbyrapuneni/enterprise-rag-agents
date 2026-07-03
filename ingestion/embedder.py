@@ -20,7 +20,12 @@ Two-step process per chunk:
 Entry point: embed_chunks(chunks, document_text, file_name)
 
 Returns one dict per chunk:
-  {"vector": List[float], "text": str, "metadata": dict}
+  {
+    "vector":        List[float]       — 1024-dim Cohere dense embedding
+    "sparse_vector": {"indices": List[int], "values": List[float]}  — BM25
+    "text":          str               — enriched text that was embedded
+    "metadata":      dict
+  }
 
 Environment variables:
   AWS_REGION             — Bedrock region (default: us-east-1)
@@ -38,6 +43,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import tiktoken
 from dotenv import load_dotenv
+
+from .bm25 import bm25_sparse_vector
 
 load_dotenv()
 
@@ -497,14 +504,18 @@ def embed_chunks(
             "All vectors discarded — document must be re-queued."
         )
 
-    results = [
-        {
-            "vector":   vector,
-            "text":     enriched_text,
-            "metadata": chunk.get("metadata", {}),
-        }
-        for chunk, vector, enriched_text in zip(chunks, all_vectors, enriched_texts)
-    ]
+    # BM25 sparse vectors run on raw chunk text, not the enriched text.
+    # Exact financial term matching ("SOFR 2024-06-30", "Form 10-Q Schedule 14A")
+    # should target the original document content, not the AI context prefix.
+    results = []
+    for chunk, vector, enriched_text in zip(chunks, all_vectors, enriched_texts):
+        sp_indices, sp_values = bm25_sparse_vector(chunk.get("text", ""))
+        results.append({
+            "vector":        vector,
+            "sparse_vector": {"indices": sp_indices, "values": sp_values},
+            "text":          enriched_text,
+            "metadata":      chunk.get("metadata", {}),
+        })
 
     logger.info(
         f"[{file_name}] EMBED SUCCESS: {len(results)} vectors "

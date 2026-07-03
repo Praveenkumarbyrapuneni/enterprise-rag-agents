@@ -4,32 +4,24 @@ agents/retriever.py — Agent 2: Retrieval
 Search strategy:
   1. Embed question (and hyde_query if set) via Cohere Embed v3 on Bedrock
      using input_type="search_query" — critical: wrong type degrades accuracy 5-15%.
-  2. Dense vector search in Qdrant — top _QDRANT_TOP_K=20 per query vector.
-  3. Dual-query union (question + hyde_query, deduped by point ID):
-     HyDE can hallucinate financial figures ("revenue was $47B" when real = $39B).
-     The direct-question search is the safety net — the reranker picks the winner.
-  4. Cohere rerank: up to 40 candidates → top _RERANK_TOP_N=8.
-     Times out after _COHERE_TIMEOUT seconds; falls back to raw vector order (non-fatal).
-  5. MMR: remove near-duplicate chunks while preserving relevance.
-     Uses Qdrant-stored vectors — no extra API calls.
-  6. Parent context expansion: chunks with a parent_id get swapped for their
+  2. Hybrid search in Qdrant — Prefetch (dense + BM25 sparse) fused via RRF.
+     Dense captures semantic meaning. BM25 captures exact financial terms
+     ("SOFR rate 2024-06-30", "Form 10-Q Schedule 14A", specific dollar amounts).
+     RRF (Reciprocal Rank Fusion) combines both without parameter tuning.
+  3. Cohere rerank: up to 40 candidates → top _RERANK_TOP_N=8.
+     Times out after _COHERE_TIMEOUT seconds; falls back to raw RRF order (non-fatal).
+  4. MMR: remove near-duplicate chunks while preserving relevance.
+     Uses stored dense vectors — no extra API calls.
+  5. Parent context expansion: chunks with a parent_id get swapped for their
      full parent paragraph from PostgreSQL. Wider context = better synthesis.
 
 Production failure handling:
   - Empty question          → set error, return immediately
   - Qdrant timeout          → retry 3x with exponential backoff; set error on exhaustion
   - Zero results            → set error, return cleanly
-  - Cohere rerank failure   → log warning, return raw top-k (non-fatal, query still completes)
+  - Cohere rerank failure   → log warning, return raw RRF order (non-fatal)
   - PostgreSQL parent fetch  → log warning, return child text only (non-fatal)
   - Missing COHERE_API_KEY  → skip reranking, log warning
-
-Note on BM25 / hybrid search:
-  Our Qdrant collection stores dense vectors only (ingested in Phase 1).
-  True sparse BM25 vectors require re-ingestion with sparse + dense fields.
-  Cohere Embed v3 (top-tier model) already encodes lexical information well —
-  research shows BM25 can *reduce* accuracy with strong embedding models.
-  The Cohere reranker adds 30-48% precision on top of dense retrieval alone.
-  BM25 hybrid is planned for Phase B (AWS migration + full re-ingestion).
 """
 
 import concurrent.futures
@@ -44,7 +36,11 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import (
+    FieldCondition, Filter, FusionQuery, Fusion, MatchValue, Prefetch, SparseVector
+)
+
+from ingestion.bm25 import bm25_sparse_vector
 
 from .logger import get_logger
 from .state import RAGState, RetrievedChunk
@@ -123,7 +119,7 @@ def _embed_query(text: str) -> list[float]:
     return result["embeddings"][0]
 
 
-# ── Step 2: Qdrant dense vector search ───────────────────────────────────────
+# ── Step 2: Qdrant hybrid search (dense + BM25 sparse, RRF fusion) ────────────
 
 
 def _build_tenant_filter(tenant_id: str) -> Filter | None:
@@ -143,15 +139,55 @@ def _build_tenant_filter(tenant_id: str) -> Filter | None:
     )
 
 
-def _search_qdrant(vector: list[float], top_k: int, tenant_filter: Filter | None = None) -> list[dict]:
+def _extract_dense_vector(raw) -> list[float]:
+    """Extract dense vector from named-vector dict or plain list (backward compat)."""
+    if isinstance(raw, dict):
+        return raw.get("dense") or []
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def _search_qdrant(
+    dense_vecs: list[list[float]],
+    sparse_vecs: list[tuple[list[int], list[float]]],
+    top_k: int,
+    tenant_filter: Filter | None = None,
+) -> list[dict]:
     """
-    Dense vector search. Returns payload + stored vector per hit.
-    with_vectors=True fetches stored vectors for MMR cosine similarity — no
-    second API call needed.
+    Hybrid dense + BM25 sparse search with RRF (Reciprocal Rank Fusion).
+
+    dense_vecs and sparse_vecs are parallel lists — one entry per query vector
+    (question, HyDE hypothesis, or sub-question).
+
+    Each query vector produces two Prefetch entries: one for "dense" (semantic)
+    and one for "sparse" (BM25 exact terms). Qdrant fuses all Prefetch results
+    using RRF, which combines rankings without needing a tuning parameter.
+
+    with_vectors=True fetches stored dense vectors for MMR cosine similarity —
+    no second API call needed.
 
     Retries on connection errors and Qdrant 5xx. Raises RuntimeError after
     all retries are exhausted so the caller can set state["error"].
     """
+    # Build Prefetch list: one dense + one sparse entry per query vector.
+    # Sparse Prefetch is skipped when BM25 produced no terms (empty text, all stopwords).
+    prefetches = []
+    for d_vec, (s_idx, s_val) in zip(dense_vecs, sparse_vecs):
+        prefetches.append(Prefetch(
+            query=d_vec,
+            using="dense",
+            limit=top_k,
+            filter=tenant_filter,
+        ))
+        if s_idx:
+            prefetches.append(Prefetch(
+                query=SparseVector(indices=s_idx, values=s_val),
+                using="sparse",
+                limit=top_k,
+                filter=tenant_filter,
+            ))
+
     last_exc: Optional[Exception] = None
 
     for attempt in range(_QDRANT_RETRIES + 1):
@@ -165,9 +201,9 @@ def _search_qdrant(vector: list[float], top_k: int, tenant_filter: Filter | None
         try:
             hits = _get_qdrant().query_points(
                 collection_name=_COLLECTION,
-                query=vector,
+                prefetch=prefetches,
+                query=FusionQuery(fusion=Fusion.RRF),
                 limit=top_k,
-                query_filter=tenant_filter,
                 with_payload=True,
                 with_vectors=True,
             ).points
@@ -175,7 +211,7 @@ def _search_qdrant(vector: list[float], top_k: int, tenant_filter: Filter | None
                 {
                     "id":      str(hit.id),
                     "score":   hit.score,
-                    "vector":  hit.vector if isinstance(hit.vector, list) else [],
+                    "vector":  _extract_dense_vector(hit.vector),
                     "payload": hit.payload or {},
                 }
                 for hit in hits
@@ -384,27 +420,24 @@ def retrieve(state: RAGState) -> RAGState:
     tenant_filter = _build_tenant_filter(tenant_id)
 
     try:
-        # ── Embed ─────────────────────────────────────────────────────────────
-        q_vector = _embed_query(question)
-        vectors = [q_vector]
+        # ── Build dense + sparse vectors for all query texts ──────────────────
+        dense_vecs: list[list[float]] = [_embed_query(question)]
+        sparse_vecs: list[tuple[list[int], list[float]]] = [bm25_sparse_vector(question)]
 
         hyde_query = (state.get("hyde_query") or "").strip()
         if hyde_query:
-            vectors.append(_embed_query(hyde_query))
+            dense_vecs.append(_embed_query(hyde_query))
+            sparse_vecs.append(bm25_sparse_vector(hyde_query))
 
         # For comparative/multi_company: search with each sub-question independently.
         for sq in (state.get("sub_questions") or []):
             if sq.strip():
-                vectors.append(_embed_query(sq.strip()))
+                dense_vecs.append(_embed_query(sq.strip()))
+                sparse_vecs.append(bm25_sparse_vector(sq.strip()))
 
-        # ── Search (deduplicated union, tenant-filtered) ──────────────────────
-        seen_ids: set[str] = set()
-        candidates: list[dict] = []
-        for vec in vectors:
-            for hit in _search_qdrant(vec, _QDRANT_TOP_K, tenant_filter):
-                if hit["id"] not in seen_ids:
-                    seen_ids.add(hit["id"])
-                    candidates.append(hit)
+        # ── Single hybrid search call: all query vectors fused via RRF ───────
+        # Qdrant's RRF naturally deduplicates — no manual seen_ids needed.
+        candidates = _search_qdrant(dense_vecs, sparse_vecs, _QDRANT_TOP_K, tenant_filter)
 
         if not candidates:
             return {**state, "chunks": [], "error": "retrieve: no results found in Qdrant"}

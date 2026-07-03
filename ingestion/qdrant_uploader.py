@@ -57,6 +57,9 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType,
     PointStruct,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
     TurboQuantBitSize,
     TurboQuantization,
     TurboQuantQuantizationConfig,
@@ -174,16 +177,24 @@ def _ensure_collection() -> None:
     existing = {c.name for c in client.get_collections().collections}
 
     if COLLECTION_NAME not in existing:
-        # Custom sharding: each tenant's vectors route to their own shard.
-        # On laptop (single Docker node) this is logical isolation.
-        # On AWS (multi-node Qdrant cluster) this becomes physical isolation — Phase B.
-        create_kwargs: dict = dict(
+        # Named vectors: "dense" (Cohere 1024-dim) + "sparse" (BM25).
+        # Hybrid search (Prefetch + RRF) uses both; MMR uses only "dense".
+        # ponytail: custom sharding skipped in Phase A (single Docker node — no benefit).
+        # Phase B: add ShardingMethod.CUSTOM + create_shard_key() per tenant on AWS cluster.
+        client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=VECTOR_SIZE,
-                distance=Distance.COSINE,
-                on_disk=False,  # keep in RAM; flip to True on AWS if >40GB
-            ),
+            vectors_config={
+                "dense": VectorParams(
+                    size=VECTOR_SIZE,
+                    distance=Distance.COSINE,
+                    on_disk=False,  # keep in RAM; flip to True on AWS if >40GB
+                ),
+            },
+            sparse_vectors_config={
+                "sparse": SparseVectorParams(
+                    index=SparseIndexParams(on_disk=False),
+                ),
+            },
             hnsw_config=HnswConfigDiff(
                 m=_HNSW_M,
                 ef_construct=_HNSW_EF,
@@ -196,9 +207,6 @@ def _ensure_collection() -> None:
                 )
             ),
         )
-        # ponytail: custom sharding skipped in Phase A (single Docker node — no benefit).
-        # Phase B: add ShardingMethod.CUSTOM + create_shard_key() per tenant on AWS cluster.
-        client.create_collection(**create_kwargs)
 
         # Payload indexes — must exist before first write to avoid HNSW rebuild.
         # tenant_id index is CRITICAL: without it every query does a full scan.
@@ -218,6 +226,7 @@ def _ensure_collection() -> None:
         logger.info(
             f"[uploader] Created Qdrant collection '{COLLECTION_NAME}' — "
             f"HNSW(m={_HNSW_M}, ef={_HNSW_EF}) + TurboQuant 4-bit + "
+            f"dense(1024-dim Cohere) + sparse(BM25) + "
             f"5 payload indexes (tenant_id, file_hash, file_name, strategy, page)"
         )
 
@@ -343,10 +352,18 @@ def _build_points(embedded_chunks: List[Dict[str, Any]], tenant_id: str = "") ->
         # but explicit parameter wins (single source of truth on upload).
         if tenant_id:
             payload["tenant_id"] = tenant_id
+
+        sp = chunk.get("sparse_vector", {})
         points.append(
             PointStruct(
                 id=str(uuid.uuid4()),
-                vector=chunk["vector"],
+                vector={
+                    "dense":  chunk["vector"],
+                    "sparse": SparseVector(
+                        indices=sp.get("indices", []),
+                        values=sp.get("values", []),
+                    ),
+                },
                 payload=payload,
             )
         )
@@ -579,6 +596,7 @@ def query_similar(
     hits = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
+        using="dense",          # named vector field — required after hybrid collection setup
         query_filter=query_filter,
         limit=top_k,
         with_payload=True,
@@ -649,6 +667,7 @@ if __name__ == "__main__":
     sample = [
         {
             "vector": [0.1] * 1024,
+            "sparse_vector": {"indices": [100, 200, 300], "values": [1.0, 1.5, 2.0]},
             "text": "Revenue declined 14% in Q3.",
             "metadata": {
                 "file_name": "test.pdf",
@@ -664,7 +683,10 @@ if __name__ == "__main__":
     ]
     points = _build_points(sample)
     assert len(points) == 1
-    assert len(points[0].vector) == 1024
+    # named vectors — points[0].vector is now a dict
+    assert isinstance(points[0].vector, dict)
+    assert len(points[0].vector["dense"]) == 1024
+    assert points[0].vector["sparse"].indices == [100, 200, 300]
     assert points[0].payload["text"] == "Revenue declined 14% in Q3."
     assert points[0].payload["strategy"] == "fixed"
     assert points[0].payload["file_hash"] == "abc123"
@@ -680,7 +702,17 @@ if __name__ == "__main__":
     ids = {str(p.id) for p in _build_points(sample * 100)}
     assert len(ids) == 100
 
+    # 6. Chunk with no sparse_vector still builds correctly (backward compat)
+    no_sparse = [{
+        "vector": [0.2] * 1024,
+        "text": "Fallback chunk.",
+        "metadata": {"file_name": "f.pdf", "file_hash": "xyz", "strategy": "fixed"},
+    }]
+    pts = _build_points(no_sparse)
+    assert pts[0].vector["sparse"].indices == []
+    assert pts[0].vector["sparse"].values  == []
+
     print(
         "✅ qdrant_uploader self-check passed — "
-        "validation, point building, batch sizing, UUID uniqueness all correct"
+        "validation, named vectors, sparse, batch sizing, UUID uniqueness all correct"
     )

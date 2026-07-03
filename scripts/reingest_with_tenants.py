@@ -1,17 +1,18 @@
 """
-scripts/reingest_with_tenants.py — Delete + re-ingest all SEC filings with tenant_id.
+scripts/reingest_with_tenants.py — Delete + re-ingest all SEC filings.
 
-Run ONCE after Phase 3 setup:
-    python -m scripts.reingest_with_tenants
+Run to rebuild the Qdrant collection from scratch (e.g., after adding BM25 hybrid
+search, which requires named dense+sparse vector fields in the collection).
 
 What this does:
-  1. Deletes the existing Qdrant collection (chunks have no tenant_id)
+  1. Deletes the existing Qdrant collection
   2. Resets ingestion_status for these files (forces re-ingest)
-  3. Re-creates Qdrant collection with tenant_id payload index
-  4. Re-ingests all 3 SEC filings directly (no Celery needed) with correct tenant_id
+  3. Clears parent_chunks for these files (fresh UUIDs on re-ingest)
+  4. Re-creates Qdrant collection with dense + BM25 sparse vectors
+  5. Re-ingests all 3 SEC filings directly (no Celery needed) with correct tenant_id
 
-After this script, every chunk in Qdrant has tenant_id in its payload.
-Goldman analyst queries will ONLY return Goldman chunks. Same for Apple, JPMorgan.
+After this script, every chunk in Qdrant has both a dense (Cohere) and sparse
+(BM25) vector. Goldman analyst queries will ONLY return Goldman chunks.
 
 WARNING: Do not run while Celery workers are actively ingesting — stop them first.
 """
@@ -44,13 +45,16 @@ def _hash_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _reset_ingestion_status(file_names: list[str]) -> int:
-    """Delete ingestion_status rows for these files so they re-ingest cleanly."""
+def _reset_postgres(file_names: list[str]) -> tuple[int, int]:
+    """
+    Delete ingestion_status and parent_chunks rows for these files.
+    Returns (status_rows_deleted, parent_rows_deleted).
+    """
     import psycopg2
     url = os.getenv("DATABASE_URL")
     if not url:
-        print("WARNING: DATABASE_URL not set — skipping ingestion_status reset")
-        return 0
+        print("WARNING: DATABASE_URL not set — skipping PostgreSQL reset")
+        return 0, 0
     conn = psycopg2.connect(url)
     try:
         with conn.cursor() as cur:
@@ -58,9 +62,14 @@ def _reset_ingestion_status(file_names: list[str]) -> int:
                 "DELETE FROM ingestion_status WHERE file_name = ANY(%s)",
                 (file_names,),
             )
-            deleted = cur.rowcount
+            status_deleted = cur.rowcount
+            cur.execute(
+                "DELETE FROM parent_chunks WHERE file_name = ANY(%s)",
+                (file_names,),
+            )
+            parent_deleted = cur.rowcount
         conn.commit()
-        return deleted
+        return status_deleted, parent_deleted
     finally:
         conn.close()
 
@@ -102,16 +111,16 @@ def reingest() -> None:
     else:
         print(f"  Collection '{COLLECTION_NAME}' did not exist — nothing to delete.")
 
-    # ── Step 2: Reset ingestion_status ───────────────────────────────────────
-    print("\nStep 2: Resetting ingestion_status for target files...")
-    n = _reset_ingestion_status(list(TENANT_MAP.keys()))
-    print(f"  Cleared {n} ingestion_status record(s).")
+    # ── Step 2: Reset PostgreSQL (ingestion_status + parent_chunks) ──────────
+    print("\nStep 2: Resetting PostgreSQL for target files...")
+    s_del, p_del = _reset_postgres(list(TENANT_MAP.keys()))
+    print(f"  Cleared {s_del} ingestion_status record(s), {p_del} parent_chunks row(s).")
 
     # ── Step 3: Bootstrap schema + create new collection ─────────────────────
-    print("\nStep 3: Creating new Qdrant collection with tenant_id payload index...")
+    print("\nStep 3: Creating new Qdrant collection with dense + BM25 sparse vectors...")
     bootstrap_schema()
     _ensure_collection()
-    print(f"  Collection '{COLLECTION_NAME}' created with tenant_id index.")
+    print(f"  Collection '{COLLECTION_NAME}' created (dense + sparse + tenant_id index).")
 
     # ── Step 4: Re-ingest each file ───────────────────────────────────────────
     print("\nStep 4: Re-ingesting files with tenant_id...\n")
@@ -147,7 +156,9 @@ def reingest() -> None:
             # Embed
             document_text = build_document_text(pages)
             embedded = embed_chunks(chunks, document_text, file_name)
-            print(f"    Embedded: {len(embedded)} vectors ({len(embedded[0]['vector'])} dims each)")
+            sp_terms = len(embedded[0].get("sparse_vector", {}).get("indices", []))
+            print(f"    Embedded: {len(embedded)} vectors "
+                  f"({len(embedded[0]['vector'])} dense dims, ~{sp_terms} sparse terms/chunk)")
 
             # Upload — pass tenant_id so it goes into Qdrant payload + shard key
             result = upload_document(
