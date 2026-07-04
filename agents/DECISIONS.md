@@ -944,7 +944,8 @@ question and each candidate chunk as a cross-encoder — fundamentally different
 from embedding similarity. It re-scores all candidates by actual relevance and
 returns the top 8.
 
-The reranker adds 30-48% precision improvement on top of the hybrid search.
+Cohere's published benchmarks report 30-48% precision improvement from reranking
+(measured on Cohere's test sets — not independently verified on this corpus).
 It runs inside a ThreadPoolExecutor with a 12-second timeout — if Cohere's API
 hangs, retrieval falls back to raw RRF order (non-fatal).
 
@@ -1073,7 +1074,8 @@ RAGAS is the standard evaluation library for RAG systems. It was evaluated and
 rejected.
 
 Three failures on financial document corpora:
-1. RAGAS failed to produce scores on 83.5% of FinanceBench examples. Its
+1. RAGAS failed to produce scores on 83.5% of FinanceBench examples (Islam et al.,
+   FinanceBench 2023). Its
    claim-extraction mechanism breaks on numerical financial reasoning.
 2. RAGAS uses OpenAI by default. Financial document content cannot leave the
    AWS VPC.
