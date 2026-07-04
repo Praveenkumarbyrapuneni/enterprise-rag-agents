@@ -150,8 +150,10 @@ def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
     Return elements in correct visual reading order for N-column layouts.
 
     Column count is detected from gaps in the x-center distribution of text
-    blocks. A gap wider than 8% of the page width with no text indicates a
-    column gutter. Works for 1, 2, 3, or more columns.
+    blocks. The gutter threshold is adaptive: max(2.5 × median gap between
+    x-centers, 3% of page width). This catches tight gutters (5–6% of page
+    width) that a fixed 8% threshold would miss, while the 3% floor prevents
+    false splits from within-column indentation noise. Works for any column count.
 
     Full-width elements (section headers, wide tables spanning ≥60% of page)
     interrupt column flow: everything above them is emitted column-by-column
@@ -173,9 +175,19 @@ def _reading_order(elements: List[Dict], page_width: float) -> List[Dict]:
     if not text_els:
         return sorted(elements, key=lambda e: e["y"])
 
-    # Sort all text block x-centers; gaps > 8% of page width are column gutters
+    # Adaptive column-gutter detection.
+    # Within a column, x-centers cluster tightly. Gutters are outlier gaps.
+    # Threshold = max(2.5 × median gap, 3% of page width).
+    # The median factor adapts to the document's own spacing so tight gutters
+    # (5–6% of page width) are caught. The 3% floor prevents false splits
+    # from normal within-column indentation variation.
     centers = sorted(cx(e) for e in text_els)
-    gap_threshold = page_width * 0.08
+    gaps = [centers[i] - centers[i - 1] for i in range(1, len(centers))]
+    if len(gaps) >= 2:
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        gap_threshold = max(page_width * 0.03, median_gap * 2.5)
+    else:
+        gap_threshold = page_width * 0.08  # ponytail: fallback for <2 gaps (≤2 text blocks)
     boundaries = [0.0]
     for i in range(1, len(centers)):
         if centers[i] - centers[i - 1] > gap_threshold:

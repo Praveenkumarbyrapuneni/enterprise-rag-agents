@@ -214,11 +214,14 @@ Standard PDF text extraction reads elements in the order they appear in the PDF
 stream — not in visual reading order. A 2-column page read left-to-right produces
 interleaved text from both columns, making it unreadable.
 
-Fix: x-center positions of all text blocks are analyzed. Gaps wider than 8% of
-page width indicate column gutters. Content is then emitted column-by-column,
-top-to-bottom within each column, columns left-to-right. Full-width elements
-(headers, wide tables spanning >60% of page width) interrupt column flow and are
-emitted at their correct vertical position.
+Fix: x-center positions of all text blocks are analyzed. The gutter threshold
+is adaptive: max(2.5 × median gap between x-centers, 3% of page width). This
+catches tight gutters (5–6% of page width) that a fixed percentage threshold
+would miss, while the 3% floor prevents false splits from within-column
+indentation variation. Content is then emitted column-by-column, top-to-bottom
+within each column, columns left-to-right. Full-width elements (headers, wide
+tables spanning >60% of page width) interrupt column flow and are emitted at
+their correct vertical position.
 
 Works for 1, 2, 3, or more columns without configuration.
 
