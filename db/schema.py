@@ -99,6 +99,22 @@ CREATE TABLE IF NOT EXISTS query_feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_tenant_created
     ON query_feedback (tenant_id, created_at DESC);
 
+-- Chunks delivered to the synthesizer per query. Soft link via query_id (no FK
+-- to avoid slowing down retrieval with a constraint check on every insert).
+-- Used to build reranker training data: cited=true chunks are positives, false are negatives.
+CREATE TABLE IF NOT EXISTS query_chunks (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_id    UUID         NOT NULL,
+    tenant_id   TEXT         NOT NULL,
+    chunk_text  TEXT         NOT NULL,
+    source      TEXT         NOT NULL,
+    score       NUMERIC(6,4),
+    cited       BOOLEAN      NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_query_chunks_query_id ON query_chunks (query_id);
+CREATE INDEX IF NOT EXISTS idx_query_chunks_tenant   ON query_chunks (tenant_id, created_at DESC);
+
 -- Per-tenant tuned retrieval parameters. Updated automatically by feedback tuner.
 -- Falls back to hardcoded defaults in retriever.py if no row exists for a tenant.
 CREATE TABLE IF NOT EXISTS retrieval_params (

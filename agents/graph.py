@@ -279,7 +279,7 @@ def run_query(
         }
 
     try:
-        final   = _graph.invoke(initial_state(question, tenant_id=tenant_id, customer_id=customer_id))
+        final   = _graph.invoke(initial_state(question, tenant_id=tenant_id, customer_id=customer_id, query_id=query_id))
         elapsed = time.time() - start
 
         faith   = final.get("faithfulness", 0.0)
