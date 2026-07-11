@@ -5,6 +5,7 @@ Endpoints:
   POST /auth/register — create a user account under a tenant
   POST /auth/login    — returns a signed JWT
   POST /query         — main query endpoint (JWT-authenticated, rate-limited)
+  POST /feedback      — submit helpful/not-helpful feedback on a query response
   GET  /health        — liveness check (no auth, for load balancer)
   GET  /ready         — readiness check (verifies Qdrant + PostgreSQL connectivity)
 
@@ -38,6 +39,7 @@ load_dotenv()
 from agents.graph import run_query
 from agents.logger import get_logger
 from api.auth import decode_token, router as auth_router
+from api.feedback_router import router as feedback_router
 from api.rate_limit import check_rate_limit, RATE_LIMIT
 
 logger = get_logger(__name__)
@@ -65,6 +67,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(feedback_router)
 
 
 # ── Fork-safe startup hook ────────────────────────────────────────────────────
@@ -155,6 +158,7 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
+    query_id:     str           # submit to POST /feedback to rate this answer
     answer:       str
     sources:      list[str]
     query_type:   str
@@ -162,6 +166,7 @@ class QueryResponse(BaseModel):
     faithfulness: float
     relevance:    float
     latency_ms:   float
+    cached:       bool          # True = served from semantic cache (⚡ tag this in UI)
     error:        Optional[str] = None
 
 
@@ -317,6 +322,7 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
         safe_error     = "Pipeline completed with reduced confidence." if raw_error else None
 
         return QueryResponse(
+            query_id     = result["query_id"],
             answer       = result["answer"],
             sources      = result["sources"],
             query_type   = result["query_type"],
@@ -324,6 +330,7 @@ def query(req: QueryRequest, user: dict = Depends(_auth)):
             faithfulness = result["faithfulness"],
             relevance    = result["relevance"],
             latency_ms   = latency_ms,
+            cached       = result.get("cached", False),
             error        = safe_error,
         )
 

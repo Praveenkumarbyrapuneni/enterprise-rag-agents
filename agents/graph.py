@@ -54,6 +54,7 @@ Entry point: run_query(question, tenant_id, customer_id) → dict
 """
 
 import time
+import uuid
 from typing import Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -63,6 +64,7 @@ from .evaluator import _FAITH_PASS, _MAX_RETRIES, _REL_PASS, _WARNING, _is_canno
 from .logger import get_logger
 from .query_analyzer import analyze_query
 from .retriever import retrieve
+from .semantic_cache import get_cached, set_cache
 from .state import RAGState, initial_state
 from .synthesizer import synthesize
 from .evaluator import evaluate
@@ -222,13 +224,13 @@ def run_query(
     """
     Main entry point for the RAG pipeline.
 
-    Args:
-        question:    The user's question in plain English.
-        tenant_id:   Which company's data to search ("apple", "goldman", "jpmorgan", "demo").
-        customer_id: Specific customer within the tenant for transaction lookups.
+    Checks the semantic cache first. On a hit, returns the cached answer tagged
+    with cached=True — the full pipeline is skipped. On a miss, runs the pipeline
+    and stores the result in the cache for future hits.
 
     Returns:
         {
+            "query_id":     str   — UUID for feedback submission
             "answer":       str   — grounded answer with inline citations
             "sources":      list  — list of cited sources
             "query_type":   str   — classification (sql, hybrid, numerical, etc.)
@@ -236,14 +238,17 @@ def run_query(
             "faithfulness": float — score 0.0–1.0
             "relevance":    float — score 0.0–1.0
             "retry_count":  int   — how many retries were needed (0 or 1)
+            "cached":       bool  — True if served from semantic cache
             "error":        str | None
         }
     """
     question = (question or "").strip()
+    query_id = str(uuid.uuid4())
 
     if not question:
         logger.warning("[graph] run_query called with empty question")
         return {
+            "query_id":     query_id,
             "answer":       "Please provide a question.",
             "sources":      [],
             "query_type":   "general",
@@ -251,6 +256,7 @@ def run_query(
             "faithfulness": 0.0,
             "relevance":    0.0,
             "retry_count":  0,
+            "cached":       False,
             "error":        "empty question",
         }
 
@@ -259,6 +265,18 @@ def run_query(
         f"question='{question[:100]}{'...' if len(question) > 100 else ''}'"
     )
     start = time.time()
+
+    # ── Cache check (skip for SQL — live data must always be fresh) ───────────
+    # We pass data_source="rag" as a hint; get_cached skips SQL internally too.
+    cached = get_cached(question, tenant_id=tenant_id, data_source="rag")
+    if cached:
+        elapsed = time.time() - start
+        logger.info(f"[graph] CACHE HIT — {elapsed*1000:.0f}ms saved")
+        return {
+            "query_id":     query_id,
+            "retry_count":  0,
+            **cached,
+        }
 
     try:
         final   = _graph.invoke(initial_state(question, tenant_id=tenant_id, customer_id=customer_id))
@@ -276,7 +294,8 @@ def run_query(
             f"error={'none' if not error else error[:60]}"
         )
 
-        return {
+        result = {
+            "query_id":     query_id,
             "answer":       final.get("answer", ""),
             "sources":      final.get("sources", []),
             "query_type":   final.get("query_type", "general"),
@@ -284,14 +303,22 @@ def run_query(
             "faithfulness": faith,
             "relevance":    rel,
             "retry_count":  retries,
+            "cached":       False,
             "error":        error,
         }
+
+        # Store in cache only if quality is good enough to be worth caching
+        if not error and faith >= 0.8 and rel >= 0.75:
+            set_cache(question, tenant_id=tenant_id, result=result)
+
+        return result
 
     except Exception as e:
         elapsed = time.time() - start
         msg     = f"{type(e).__name__}: {e}"
         logger.error(f"[graph] PIPELINE CRASH after {elapsed:.2f}s — {msg}")
         return {
+            "query_id":     query_id,
             "answer":       (
                 "The system encountered an unexpected error. "
                 "Please try again or contact support."
@@ -302,6 +329,7 @@ def run_query(
             "faithfulness": 0.0,
             "relevance":    0.0,
             "retry_count":  0,
+            "cached":       False,
             "error":        msg,
         }
 

@@ -1,5 +1,5 @@
 """
-db/schema.py — Phase 3 PostgreSQL schema: tenant registry + mock transactions.
+db/schema.py — PostgreSQL schema: tenant registry, transactions, feedback, retrieval params.
 
 Run once before starting the API:
     python -m db.schema
@@ -86,6 +86,29 @@ CREATE INDEX IF NOT EXISTS idx_transactions_date
 -- Partial index for flagged-only queries (most rows are unflagged — avoid full scan)
 CREATE INDEX IF NOT EXISTS idx_transactions_flagged
     ON transactions (tenant_id, customer_id) WHERE flagged = true;
+
+-- User feedback on RAG answers. Links back to query_audit_log for full context.
+CREATE TABLE IF NOT EXISTS query_feedback (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_id    UUID         NOT NULL REFERENCES query_audit_log(id) ON DELETE CASCADE,
+    tenant_id   TEXT         NOT NULL,
+    helpful     BOOLEAN      NOT NULL,
+    comment     TEXT,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant_created
+    ON query_feedback (tenant_id, created_at DESC);
+
+-- Per-tenant tuned retrieval parameters. Updated automatically by feedback tuner.
+-- Falls back to hardcoded defaults in retriever.py if no row exists for a tenant.
+CREATE TABLE IF NOT EXISTS retrieval_params (
+    tenant_id        TEXT         PRIMARY KEY,
+    top_k            INTEGER      NOT NULL DEFAULT 20,
+    rerank_top_n     INTEGER      NOT NULL DEFAULT 8,
+    mmr_final_k      INTEGER      NOT NULL DEFAULT 6,
+    feedback_count   INTEGER      NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
 """
 
 # ── Seed data ─────────────────────────────────────────────────────────────────

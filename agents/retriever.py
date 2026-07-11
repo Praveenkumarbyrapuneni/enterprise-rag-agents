@@ -50,6 +50,7 @@ logger = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Default retrieval params — overridden per-tenant by feedback tuner via retrieval_params table
 _QDRANT_TOP_K   = 20     # candidates per query vector → reranker
 _RERANK_TOP_N   = 8      # reranker output → MMR input
 _MMR_FINAL_K    = 6      # chunks delivered to synthesizer
@@ -419,6 +420,13 @@ def retrieve(state: RAGState) -> RAGState:
     # Build tenant filter — applied to EVERY Qdrant search in this call
     tenant_filter = _build_tenant_filter(tenant_id)
 
+    # Load tuned params for this tenant (falls back to module-level defaults)
+    from .feedback import get_retrieval_params
+    params       = get_retrieval_params(tenant_id)
+    top_k        = params["top_k"]
+    rerank_top_n = params["rerank_top_n"]
+    mmr_final_k  = params["mmr_final_k"]
+
     try:
         # ── Build dense + sparse vectors for all query texts ──────────────────
         dense_vecs: list[list[float]] = [_embed_query(question)]
@@ -437,14 +445,14 @@ def retrieve(state: RAGState) -> RAGState:
 
         # ── Single hybrid search call: all query vectors fused via RRF ───────
         # Qdrant's RRF naturally deduplicates — no manual seen_ids needed.
-        candidates = _search_qdrant(dense_vecs, sparse_vecs, _QDRANT_TOP_K, tenant_filter)
+        candidates = _search_qdrant(dense_vecs, sparse_vecs, top_k, tenant_filter)
 
         if not candidates:
             return {**state, "chunks": [], "error": "retrieve: no results found in Qdrant"}
 
         # ── Rerank → MMR → Parent expansion ───────────────────────────────────
-        reranked = _rerank(question, candidates, _RERANK_TOP_N)
-        diverse  = _mmr(reranked, _MMR_FINAL_K)
+        reranked = _rerank(question, candidates, rerank_top_n)
+        diverse  = _mmr(reranked, mmr_final_k)
 
         parent_ids = [
             c["payload"].get("parent_id")

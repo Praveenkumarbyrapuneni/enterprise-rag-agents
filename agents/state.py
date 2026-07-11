@@ -48,6 +48,9 @@ class RAGState(TypedDict):
     relevance:    float        # threshold 0.80
     retry_count:  int          # managed exclusively by graph.py
 
+    # ── Cache ──────────────────────────────────────────────────────────────────
+    cached: bool        # True if this response was served from semantic cache
+
     # ── Error handling ─────────────────────────────────────────────────────────
     error: Optional[str]
 
@@ -76,6 +79,7 @@ def initial_state(
         faithfulness=0.0,
         relevance=0.0,
         retry_count=0,
+        cached=False,
         error=None,
     )
 
