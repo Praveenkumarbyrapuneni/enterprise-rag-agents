@@ -23,7 +23,29 @@ has a clear reason it was parked and a clear signal for when to pick it up.
 
 ## 🔲 What's Next (build in this order)
 
-### 1. Guardrails — PII detection + output validation ← build this next
+### 0. Rotate JWT_SECRET_KEY ← do this FIRST, before anything else
+
+**What:** On 2026-07-14, a malformed `.env` (a missing newline merged the
+`EMBEDDER_CONTEXT_MODE` and `JWT_SECRET_KEY` lines into one) caused part of
+the real `JWT_SECRET_KEY` value to print into a terminal session. That value
+must be treated as compromised — anyone holding it can forge a valid login
+token for any tenant, no password needed (see `api/auth.py::_make_token`).
+
+**How:**
+1. `openssl rand -hex 32` → new value
+2. Update `JWT_SECRET_KEY` in **both** `.env` files:
+   `~/Clients/personal/enterprise-rag-agents/.env` and
+   `~/Desktop/Vsoln/enterprise-rag-agents/.env`
+3. While in there, check the surrounding lines for other merged/garbled
+   values — the same formatting bug may have corrupted more than one line.
+4. Restart the API so any existing tokens signed with the old secret stop working.
+
+**Effort:** ~5 minutes. Not optional — do this before touching anything else,
+including the PII guardrails work below.
+
+---
+
+### 1. Guardrails — PII detection + output validation
 
 **What:** Two gaps before any enterprise demo:
 
