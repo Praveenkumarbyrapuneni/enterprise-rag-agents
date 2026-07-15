@@ -51,16 +51,28 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_tenant_created
     ON query_audit_log (tenant_id, created_at DESC);
 
 -- Users: one row per login. tenant_id links them to their company's data.
+-- password_hash is NULL for auth_provider='sso' — the company's own identity
+-- provider verifies the password, we never see or store one for those users.
 CREATE TABLE IF NOT EXISTS users (
     user_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     username      TEXT         UNIQUE NOT NULL,
     email         TEXT         UNIQUE NOT NULL,
-    password_hash TEXT         NOT NULL,
+    password_hash TEXT,
+    auth_provider TEXT         NOT NULL DEFAULT 'local' CHECK (auth_provider IN ('local', 'sso')),
     tenant_id     TEXT         NOT NULL,
     customer_id   TEXT         NOT NULL,
-    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT password_required_for_local CHECK (auth_provider = 'sso' OR password_hash IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users (tenant_id);
+
+-- Migration for pre-existing databases: add SSO support to a users table that
+-- was created before auth_provider existed. ponytail: no CHECK-constraint
+-- retrofit on existing tables (Postgres has no ADD CONSTRAINT IF NOT EXISTS) —
+-- the invariant is enforced at the application layer (api/auth.py, api/sso.py)
+-- for rows created after this migration; fresh installs get the CHECK above.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
 
 -- Mock financial transactions for hybrid RAG demo.
 -- In production: replaced by a Kafka → PostgreSQL real-time pipeline.

@@ -28,7 +28,19 @@ services:
       - redis_storage:/data
     restart: unless-stopped
 
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "6006:6006"   # UI + OTLP HTTP collector
+      - "4317:4317"   # OTLP gRPC collector
+    volumes:
+      - phoenix_storage:/mnt/data
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    restart: unless-stopped
+
 volumes:
   qdrant_storage:
   postgres_storage:
   redis_storage:
+  phoenix_storage:

@@ -10,6 +10,9 @@ has a clear reason it was parked and a clear signal for when to pick it up.
 
 | Feature | Completed | Notes |
 |---|---|---|
+| Local tracing/observability (Phoenix) | 2026-07-14 | `agents/tracing.py` — self-hosted OTel via Docker, auto-traces every LangGraph node + Bedrock call, manual spans on the 4 ingestion steps. Verified live: toy graph proved per-node spans (including non-LLM nodes), real Apple doc ingestion proved end-to-end. See Step 8 in Phase B checklist below for the AWS migration note (SQLite → RDS). |
+| Company SSO login (OIDC) | 2026-07-14 | `api/sso.py` — employees log in with their existing company account (Okta/Azure AD/Google Workspace/any OIDC provider) instead of a new username+password. Config-only to swap providers (`OIDC_ISSUER_URL`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI`/`SESSION_SECRET_KEY`). Issues the same JWT shape as password login — zero downstream changes. Old password-based `/auth/register`+`/auth/login` kept alongside for local testing without a real IdP; a real deployment just wouldn't expose those two endpoints. `db/schema.py` migrated: `users.password_hash` now nullable, new `auth_provider` column ('local'\|'sso'). **Not yet live-tested against a real identity provider** — verified via app boot + clean 503 when unconfigured; needs one manual step (register an OAuth client, e.g. free Google OAuth Client ID — your `gmail.com` already maps to the seeded `demo` tenant) to prove an actual login round-trip. |
+| cited=True chunk marking | 2026-07-14 | `agents/synthesizer.py::_mark_cited` — UPDATE query_chunks after every rag/hybrid answer |
 | Fine-tuning data export | 2026-07-11 | `scripts/export_finetune_data.py` — SFT / DPO / Reranker JSONL |
 | Active feedback loop | 2026-07-10 | `POST /feedback` + Celery auto-tunes retrieval params per tenant |
 | Semantic caching | 2026-07-10 | Qdrant collection, 0.92 cosine threshold, 1hr TTL, `⚡ cached` tag |
@@ -20,29 +23,7 @@ has a clear reason it was parked and a clear signal for when to pick it up.
 
 ## 🔲 What's Next (build in this order)
 
-### 1. cited=True chunk marking in query_chunks ← build this first
-
-**What:** When the synthesizer writes an answer, it cites specific sources. Those sources
-map back to chunks in the `query_chunks` table. Right now all chunks are stored with
-`cited=False`. We need to update the cited flag to `True` for chunks that actually
-appear in the answer's source list.
-
-**Why it matters:** The reranker training export (`data/reranker_train.jsonl`) uses
-`cited=True` as positive training examples. Without this, the reranker dataset is
-empty even if thousands of queries have been run.
-
-**Where to implement:** `agents/synthesizer.py` — after writing the answer, extract
-cited source names from the sources list and run:
-```sql
-UPDATE query_chunks SET cited = true
-WHERE query_id = %s AND source = ANY(%s)
-```
-
-**Effort:** ~1 hour. One function, one SQL update.
-
----
-
-### 2. Guardrails — PII detection + output validation
+### 1. Guardrails — PII detection + output validation ← build this next
 
 **What:** Two gaps before any enterprise demo:
 
@@ -72,7 +53,7 @@ two call sites (before pipeline + after synthesizer).
 
 ---
 
-### 3. Streaming responses (SSE)
+### 2. Streaming responses (SSE)
 
 **What:** Currently the full answer is generated before anything is returned to the caller.
 For a 500-word answer this means 4-8 seconds of silence before the first word appears.
@@ -100,7 +81,7 @@ Existing endpoint stays unchanged — no breaking change.
 
 ---
 
-### 4. One-command demo mode (Ollama local models)
+### 3. One-command demo mode (Ollama local models)
 
 **What:** Right now cloning this repo and running it requires:
 - AWS account with Bedrock access
@@ -130,7 +111,7 @@ add Ollama to docker-compose.yml as optional service.
 
 ---
 
-### 5. GraphRAG — entity relationship graph on top of vector retrieval
+### 4. GraphRAG — entity relationship graph on top of vector retrieval
 
 **What:** Vector search finds semantically similar chunks. It cannot answer relationship
 questions — "How are Goldman's Asia exposure risk factors connected to their subsidiary
@@ -606,11 +587,11 @@ about known definitions or company metadata — those are the OKF files to write
 | ~~Active feedback loop~~ | ✅ Done | Implemented — POST /feedback + Celery tuner (2026-07-10) |
 | ~~Docker prod config~~ | ✅ Done | Implemented — docker-compose.prod.yml (2026-07-10) |
 | ~~Fine-tuning data export~~ | ✅ Done | Implemented — SFT / DPO / Reranker JSONL (2026-07-11) |
+| ~~cited=True chunk marking~~ | ✅ Done | Implemented — `_mark_cited` in synthesizer.py (2026-07-14) |
 | GraphRAG | 🔲 Next | Add after guardrails + streaming are done |
 | Guardrails (PII + injection) | 🔲 Next | Before first enterprise demo |
 | Streaming responses (SSE) | 🔲 Next | Before first enterprise demo |
 | One-command demo mode | 🔲 Next | Before sharing repo with enterprise evaluators |
-| cited=True chunk marking | 🔲 Next | Required for reranker training data to work |
 | Reranker fine-tuning | 🔲 Data-gated | After 200+ reranker training triples exported |
 | Synthesizer fine-tuning (Qwen3) | 🔲 Data-gated | After 500+ SFT examples exported |
 | Live transaction streaming | 🔲 Phase B | After batch pipeline stable on AWS |
@@ -767,6 +748,27 @@ Implement after batch pipeline is stable on AWS.
 
 ---
 
+### Step 8 — Move Phoenix tracing off local SQLite onto RDS
+**What:** Phoenix (`agents/tracing.py`, added for local trace visibility into the
+query + ingestion pipelines) defaults to a SQLite file on a Docker volume. That
+breaks on ECS Fargate specifically — Fargate tasks have no persistent local disk
+across restarts or scaling, so the SQLite file is wiped on every redeploy. This
+is the one Phoenix change that isn't optional before going to AWS.
+
+**Code change:** Zero. Same container image, two env vars:
+```
+PHOENIX_SQL_DATABASE_URL=postgresql://user:pass@rds-endpoint:5432/phoenix
+PHOENIX_COLLECTOR_ENDPOINT=http://phoenix.internal:4317   # on every app/worker task
+```
+`phoenix` is just a second database on the same RDS instance from Step 2 — no new
+server, no S3/MinIO (that's a Langfuse requirement, not Phoenix's).
+
+**ECS setup:** Deploy Phoenix itself as its own ECS service (same image as local),
+behind an internal ALB or service discovery DNS so app + worker tasks can reach
+port 4317. Do not expose port 6006 (the UI) publicly without auth in front of it.
+
+---
+
 ### Phase B — Migration Order (Do Not Skip Steps)
 
 ```
@@ -777,7 +779,8 @@ Implement after batch pipeline is stable on AWS.
 5. Qdrant Cloud fifth → re-ingest all documents with dense + sparse vectors
 6. ECS API sixth      → connect to Qdrant + RDS, expose via ALB
 7. CloudWatch seventh → verify all logs flowing before going live
-8. Kinesis last       → only after batch pipeline proven stable
+8. Phoenix eighth      → point at RDS before first ECS deploy (SQLite doesn't survive Fargate restarts)
+9. Kinesis last        → only after batch pipeline proven stable
 ```
 
 **The golden rule:** Each step is just changing env vars in the ECS task

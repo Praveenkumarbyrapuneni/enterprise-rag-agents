@@ -38,8 +38,10 @@ cohere>=5.0.0
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 ragas>=0.1.0
 
-# ── Tracing ────────────────────────────────────────────────────────────────────
-langsmith>=0.1.0
+# ── Tracing (self-hosted, zero data leaves the VPC — see NEXT_VERSION.md #8) ────
+arize-phoenix-otel>=0.6.0
+openinference-instrumentation-langchain>=0.1.0
+openinference-instrumentation-bedrock>=0.1.0
 
 # ── Safety ─────────────────────────────────────────────────────────────────────
 guardrails-ai>=0.5.0
@@ -50,6 +52,10 @@ uvicorn>=0.29.0
 python-multipart>=0.0.9
 PyJWT>=2.8.0
 bcrypt>=4.0.0
+
+# ── SSO (company login via any OIDC provider — Okta, Azure AD, Google, etc.) ───
+authlib>=1.3.0
+itsdangerous>=2.2.0
 
 # ── Monitoring ─────────────────────────────────────────────────────────────────
 prometheus-client>=0.20.0

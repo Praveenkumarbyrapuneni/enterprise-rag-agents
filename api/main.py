@@ -10,9 +10,12 @@ Endpoints:
   GET  /ready         — readiness check (verifies Qdrant + PostgreSQL connectivity)
 
 Auth:
-  JWT Bearer token. Client logs in → receives token with tenant_id baked in.
+  JWT Bearer token. Client logs in (password OR company SSO, see api/sso.py)
+  → receives token with tenant_id baked in.
   /query reads tenant_id from the token — callers never pass it manually.
-  Phase B: swap _secret() to AWS Secrets Manager; add Cognito SSO option.
+  Phase B: swap _secret() to AWS Secrets Manager. SSO already works with
+  Cognito today — Cognito exposes an OIDC endpoint, just set OIDC_ISSUER_URL
+  to it, no code change.
 
 Rate limiting:
   In-memory sliding window: 10 requests/minute per user_id.
@@ -32,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
+from starlette.middleware.sessions import SessionMiddleware
 
 load_dotenv()
 
@@ -41,6 +45,7 @@ from agents.logger import get_logger
 from api.auth import decode_token, router as auth_router
 from api.feedback_router import router as feedback_router
 from api.rate_limit import check_rate_limit, RATE_LIMIT
+from api.sso import router as sso_router
 
 logger = get_logger(__name__)
 
@@ -66,7 +71,16 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+# Required by authlib's SSO login flow — holds the short-lived state/nonce
+# between GET /auth/sso/login and GET /auth/sso/callback. Unrelated to the
+# JWT signing secret; a compromised session secret only lets someone forge
+# that in-flight handshake, not mint a valid API token.
+_session_secret = os.getenv("SESSION_SECRET_KEY", "")
+if _session_secret:
+    app.add_middleware(SessionMiddleware, secret_key=_session_secret)
+
 app.include_router(auth_router)
+app.include_router(sso_router)
 app.include_router(feedback_router)
 
 

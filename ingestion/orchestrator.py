@@ -307,24 +307,40 @@ def ingest_document(self, file_path: str, file_hash: str) -> Dict:
         from ingestion.parser import parse_document
         from ingestion.qdrant_uploader import upload_document
 
+        from agents.tracing import get_tracer
+        tracer = get_tracer(__name__)
+
         logger.info(f"[{file_name}] 1/4 Parsing")
-        pages = parse_document(file_path)
+        with tracer.start_as_current_span("parse_document") as span:
+            span.set_attribute("file_name", file_name)
+            pages = parse_document(file_path)
+            span.set_attribute("pages", len(pages))
         if not pages:
             raise ValueError("Parser returned 0 pages — file may be empty or unreadable")
 
         logger.info(f"[{file_name}] 2/4 Chunking")
-        chunk_result = chunk_document(pages, file_name, file_hash)
-        chunks = chunk_result["chunks"]
-        parents = chunk_result.get("parents", [])
+        with tracer.start_as_current_span("chunk_document") as span:
+            span.set_attribute("file_name", file_name)
+            chunk_result = chunk_document(pages, file_name, file_hash)
+            chunks = chunk_result["chunks"]
+            parents = chunk_result.get("parents", [])
+            span.set_attribute("chunks", len(chunks))
+            span.set_attribute("parents", len(parents))
         if not chunks:
             raise ValueError("Chunker returned 0 chunks — document may contain only whitespace")
 
         logger.info(f"[{file_name}] 3/4 Embedding {len(chunks)} chunks")
-        document_text = build_document_text(pages)
-        embedded = embed_chunks(chunks, document_text, file_name)
+        with tracer.start_as_current_span("embed_chunks") as span:
+            span.set_attribute("file_name", file_name)
+            span.set_attribute("chunk_count", len(chunks))
+            document_text = build_document_text(pages)
+            embedded = embed_chunks(chunks, document_text, file_name)
 
         logger.info(f"[{file_name}] 4/4 Uploading to Qdrant")
-        upload_result = upload_document(embedded, parents, file_name, file_hash)
+        with tracer.start_as_current_span("upload_document") as span:
+            span.set_attribute("file_name", file_name)
+            upload_result = upload_document(embedded, parents, file_name, file_hash)
+            span.set_attribute("chunks_uploaded", upload_result.get("chunks_uploaded", 0))
 
         if upload_result.get("skipped"):
             logger.info(f"[{file_name}] INGEST SKIPPED — already complete (idempotent check inside uploader)")

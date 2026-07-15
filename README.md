@@ -301,7 +301,8 @@ Every component has a direct AWS equivalent. Only `.env` changes.
 | Celery local | ECS Fargate auto-scaling workers |
 | File logs | CloudWatch (`LOG_OUTPUT=cloudwatch`) |
 | Local files | S3 (SSE-KMS encrypted) |
-| JWT local secret | AWS Cognito User Pools |
+| JWT local secret | AWS Secrets Manager |
+| Company SSO (already works today, any OIDC provider) | Point `OIDC_ISSUER_URL` at Cognito's OIDC endpoint — no code change |
 | API local | ECS Fargate + Application Load Balancer |
 
 ---

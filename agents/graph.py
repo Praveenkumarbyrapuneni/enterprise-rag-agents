@@ -59,6 +59,13 @@ from typing import Optional
 
 from langgraph.graph import END, START, StateGraph
 
+from .tracing import get_tracer
+
+# Registers OTel + activates OpenInference auto-instrumentation (LangChain/LangGraph,
+# Bedrock) before any traced client is constructed below — every node in this
+# pipeline shows up as a span in Phoenix with zero per-node code changes.
+get_tracer(__name__)
+
 from .db_lookup import db_lookup
 from .evaluator import _FAITH_PASS, _MAX_RETRIES, _REL_PASS, _WARNING, _is_cannot_answer
 from .logger import get_logger
