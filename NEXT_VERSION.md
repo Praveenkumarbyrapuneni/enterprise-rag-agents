@@ -1,9 +1,194 @@
-# Version 2 — Planned Upgrades
+# Next Version — Planned Upgrades
 
-This file documents every known limitation and improvement that was deliberately
-excluded from Version 1. Each item was evaluated, understood, and parked with a
-clear reason. This is not a wishlist — every item here has a specific trigger
-condition that tells you exactly when to implement it.
+This file documents every known limitation and planned improvement with a specific
+trigger condition for when to build each one. This is not a wishlist — every item
+has a clear reason it was parked and a clear signal for when to pick it up.
+
+---
+
+## ✅ Completed (most recent first)
+
+| Feature | Completed | Notes |
+|---|---|---|
+| Local tracing/observability (Phoenix) | 2026-07-14 | `agents/tracing.py` — self-hosted OTel via Docker, auto-traces every LangGraph node + Bedrock call, manual spans on the 4 ingestion steps. Verified live: toy graph proved per-node spans (including non-LLM nodes), real Apple doc ingestion proved end-to-end. See Step 8 in Phase B checklist below for the AWS migration note (SQLite → RDS). |
+| Company SSO login (OIDC) | 2026-07-14 | `api/sso.py` — employees log in with their existing company account (Okta/Azure AD/Google Workspace/any OIDC provider) instead of a new username+password. Config-only to swap providers (`OIDC_ISSUER_URL`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI`/`SESSION_SECRET_KEY`). Issues the same JWT shape as password login — zero downstream changes. Old password-based `/auth/register`+`/auth/login` kept alongside for local testing without a real IdP; a real deployment just wouldn't expose those two endpoints. `db/schema.py` migrated: `users.password_hash` now nullable, new `auth_provider` column ('local'\|'sso'). **Not yet live-tested against a real identity provider** — verified via app boot + clean 503 when unconfigured; needs one manual step (register an OAuth client, e.g. free Google OAuth Client ID — your `gmail.com` already maps to the seeded `demo` tenant) to prove an actual login round-trip. |
+| cited=True chunk marking | 2026-07-14 | `agents/synthesizer.py::_mark_cited` — UPDATE query_chunks after every rag/hybrid answer |
+| Fine-tuning data export | 2026-07-11 | `scripts/export_finetune_data.py` — SFT / DPO / Reranker JSONL |
+| Active feedback loop | 2026-07-10 | `POST /feedback` + Celery auto-tunes retrieval params per tenant |
+| Semantic caching | 2026-07-10 | Qdrant collection, 0.92 cosine threshold, 1hr TTL, `⚡ cached` tag |
+| Docker prod config | 2026-07-10 | `docker-compose.prod.yml` — pinned versions, health checks, resource limits |
+| Hybrid search (dense + BM25) | 2026-07-03 | Cohere dense + BM25 sparse + RRF fusion in single Qdrant query |
+
+---
+
+## 🔲 What's Next (build in this order)
+
+### 0. Rotate JWT_SECRET_KEY ← do this FIRST, before anything else
+
+**What:** On 2026-07-14, a malformed `.env` (a missing newline merged the
+`EMBEDDER_CONTEXT_MODE` and `JWT_SECRET_KEY` lines into one) caused part of
+the real `JWT_SECRET_KEY` value to print into a terminal session. That value
+must be treated as compromised — anyone holding it can forge a valid login
+token for any tenant, no password needed (see `api/auth.py::_make_token`).
+
+**How:**
+1. `openssl rand -hex 32` → new value
+2. Update `JWT_SECRET_KEY` in **both** `.env` files:
+   `~/Clients/personal/enterprise-rag-agents/.env` and
+   `~/Desktop/Vsoln/enterprise-rag-agents/.env`
+3. While in there, check the surrounding lines for other merged/garbled
+   values — the same formatting bug may have corrupted more than one line.
+4. Restart the API so any existing tokens signed with the old secret stop working.
+
+**Effort:** ~5 minutes. Not optional — do this before touching anything else,
+including the PII guardrails work below.
+
+---
+
+### 1. Guardrails — PII detection + output validation
+
+**What:** Two gaps before any enterprise demo:
+
+*Input side — PII detection:*
+Users sometimes paste personal data into questions ("What is the policy for SSN 123-45-6789?").
+That SSN goes into the audit log, the cache, and possibly the LLM context. It must be
+detected and redacted before processing.
+
+```python
+# Before passing question to the pipeline
+question = redact_pii(question)  # mask SSN, credit card numbers, account numbers
+```
+
+Use `presidio-analyzer` (Microsoft, open source) — it detects 50+ PII entity types
+with no external API call. Runs locally. Zero data leaves.
+
+*Output side — answer validation:*
+The synthesizer should never produce answers that contain raw PII from documents —
+account numbers, personal identifiers, transaction IDs that reference other customers.
+A second Presidio pass on the answer before returning it catches this.
+
+**Why it's blocking:** Any financial institution demo will ask "how do you handle PII?"
+A system with no answer to this question fails the security review immediately.
+
+**Effort:** ~4 hours. Add `presidio-analyzer` to requirements, one redact function,
+two call sites (before pipeline + after synthesizer).
+
+---
+
+### 2. Streaming responses (SSE)
+
+**What:** Currently the full answer is generated before anything is returned to the caller.
+For a 500-word answer this means 4-8 seconds of silence before the first word appears.
+Streaming sends each word as it's generated — the user sees the answer building in real time.
+
+**Why users expect it:** ChatGPT, Claude, Gemini all stream. Any demo against a non-streaming
+system feels broken, even if the answer quality is better.
+
+**How to implement:**
+```python
+# FastAPI SSE endpoint
+@app.post("/query/stream")
+async def query_stream(req: QueryRequest, user=Depends(_auth)):
+    async def generate():
+        async for chunk in synthesizer.stream(question, context):
+            yield f"data: {json.dumps({'token': chunk})}\n\n"
+    return StreamingResponse(generate(), media_type="text/event-stream")
+```
+
+The cache check and retrieval stay synchronous. Only the synthesizer call becomes
+a streaming Bedrock `invoke_model_with_response_stream` call.
+
+**Effort:** ~1 day. New `/query/stream` endpoint alongside existing `/query`.
+Existing endpoint stays unchanged — no breaking change.
+
+---
+
+### 3. One-command demo mode (Ollama local models)
+
+**What:** Right now cloning this repo and running it requires:
+- AWS account with Bedrock access
+- Cohere API key
+- Claude models enabled in Bedrock
+
+That's a 45-minute setup for a senior engineer. For an enterprise evaluator or investor
+who just wants to see it work, it's a blocker.
+
+Demo mode replaces cloud APIs with local models via Ollama:
+- Cohere Embed v3 → `nomic-embed-text` (Ollama, free, runs locally)
+- Claude Sonnet → `llama3.1:8b` (Ollama, free, runs locally)
+- Claude Haiku → `gemma3:4b` (Ollama, fast, runs locally)
+
+```bash
+# With demo mode:
+git clone ...
+cp .env.example .env       # fill in DATABASE_URL only
+DEMO_MODE=true docker compose up
+# Upload a PDF at localhost:8000/docs
+# Ask a question
+# Done — no AWS, no API keys
+```
+
+**Effort:** ~1 day. Add `DEMO_MODE` env var, swap provider clients based on flag,
+add Ollama to docker-compose.yml as optional service.
+
+---
+
+### 4. GraphRAG — entity relationship graph on top of vector retrieval
+
+**What:** Vector search finds semantically similar chunks. It cannot answer relationship
+questions — "How are Goldman's Asia exposure risk factors connected to their subsidiary
+holdings in Singapore?" That requires a knowledge graph.
+
+GraphRAG extracts entities (companies, people, dates, financial metrics) and relationships
+(owns, reports-to, affects, contradicts) from ingested documents and stores them as a
+graph. Queries that need multi-hop reasoning traverse the graph first, then retrieve
+supporting chunks.
+
+**Why after the above items:** GraphRAG is the biggest quality upgrade remaining.
+But it's wasted if the system doesn't have guardrails, streaming, and a clean demo flow.
+Get those right first — then GraphRAG makes the product substantially stronger.
+
+**Stack options:**
+- Neo4j (most mature, native graph DB, Cypher query language)
+- NetworkX (in-memory, no infra, fine for < 1M nodes)
+- Amazon Neptune (AWS-native, Phase B option)
+
+**Effort:** 1-2 weeks. Entity extraction (Claude Haiku), graph storage (Neo4j or NetworkX),
+graph traversal node added to LangGraph pipeline, query router updated to detect
+multi-hop questions.
+
+---
+
+## 🔲 Data-gated (build when training data is ready)
+
+### Reranker fine-tuning
+
+**Trigger:** `data/reranker_train.jsonl` has 200+ triples (query, pos_chunks, neg_chunks).
+
+**What:** Replace Cohere's generic reranker with a cross-encoder fine-tuned on your
+specific financial document domain. Expected improvement: 10-20% better retrieval
+precision on domain-specific queries (exact financial terms, regulatory language).
+
+**How:** Use `sentence-transformers` library, `cross-encoder/ms-marco-MiniLM-L-6-v2`
+as base, fine-tune on exported triples. Training on an A40 GPU: ~2 hours, ~$3.
+
+---
+
+### Synthesizer fine-tuning (Qwen3 local model)
+
+**Trigger:** `data/sft_synthesizer.jsonl` has 500+ examples.
+
+**What:** Fine-tune Qwen3-7B (from `llm-fine-tuning` repo) on (question, answer) pairs
+from helpful=True high-quality responses. Deploy as local synthesizer via vLLM.
+Replace Claude Sonnet API calls for routine RAG queries — use Claude only for complex ones.
+
+**Cost impact:** At 1M queries/day, Claude Sonnet costs ~$3,000/day. A local Qwen3
+serving routine queries (est. 70%) cuts that to ~$900/day. ROI: ~$2.1M/month at scale.
+
+**How:** QLoRA on RunPod A40, same pipeline as `llm-fine-tuning` repo. Add vLLM serving
+container to docker-compose. Route by query complexity in the synthesizer.
+
+---
 
 ---
 
@@ -414,25 +599,36 @@ about known definitions or company metadata — those are the OKF files to write
 
 ## Summary Table
 
-| Upgrade | Trigger to Implement |
-|---|---|
-| PDF vector graphics extraction | Users report missing chart data from specific PDF types |
-| Unlimited-OCR (self-hosted OCR) | Claude Vision API monthly cost exceeds GPU instance cost at production volume |
-| Late chunking | RAGAS recall fails systematically on documents with cross-reference language |
-| ~~Hybrid search (dense + sparse)~~ | ✅ **IMPLEMENTED** — BM25 sparse vectors + RRF fusion (2026-07-03) |
-| Live transaction streaming | Phase B AWS deployment — after batch pipeline is stable |
-| Semantic chunking (optional) | Demand for processing single-topic academic / technical documents |
-| HNSW index tuning | RAGAS context recall drops below 0.80 at full 10M document scale |
-| CloudWatch logging | Phase B AWS migration — first thing before going live |
-| Nova Pro model benchmark | After evaluator is built and RAGAS scoring works end-to-end |
-| OKF (Google Open Knowledge Format) | After full pipeline works end-to-end + RAGAS shows gaps on known facts |
-| Redis → SQS | Phase B AWS migration |
-| PostgreSQL Docker → RDS | Phase B AWS migration |
-| Celery workers → ECS | Phase B AWS migration |
-| Qdrant Docker → Qdrant Cloud/EC2 | Phase B AWS migration |
-| Local files → S3 | Phase B AWS migration |
-| FastAPI local → ECS + API Gateway | Phase B AWS migration |
-| Batch pipeline → Kinesis streaming | Phase B, after batch pipeline stable on AWS |
+| Upgrade | Status | Trigger to Implement |
+|---|---|---|
+| PDF vector graphics extraction | 🔲 Planned | Users report missing chart data from specific PDF types |
+| Unlimited-OCR (self-hosted OCR) | 🔲 Planned | Claude Vision API monthly cost exceeds GPU instance cost |
+| Late chunking | 🔲 Planned | RAGAS recall fails on cross-reference-heavy documents |
+| ~~Hybrid search (dense + sparse)~~ | ✅ Done | Implemented — BM25 + RRF (2026-07-03) |
+| ~~Semantic caching~~ | ✅ Done | Implemented — Qdrant collection, 0.92 threshold (2026-07-10) |
+| ~~Active feedback loop~~ | ✅ Done | Implemented — POST /feedback + Celery tuner (2026-07-10) |
+| ~~Docker prod config~~ | ✅ Done | Implemented — docker-compose.prod.yml (2026-07-10) |
+| ~~Fine-tuning data export~~ | ✅ Done | Implemented — SFT / DPO / Reranker JSONL (2026-07-11) |
+| ~~cited=True chunk marking~~ | ✅ Done | Implemented — `_mark_cited` in synthesizer.py (2026-07-14) |
+| GraphRAG | 🔲 Next | Add after guardrails + streaming are done |
+| Guardrails (PII + injection) | 🔲 Next | Before first enterprise demo |
+| Streaming responses (SSE) | 🔲 Next | Before first enterprise demo |
+| One-command demo mode | 🔲 Next | Before sharing repo with enterprise evaluators |
+| Reranker fine-tuning | 🔲 Data-gated | After 200+ reranker training triples exported |
+| Synthesizer fine-tuning (Qwen3) | 🔲 Data-gated | After 500+ SFT examples exported |
+| Live transaction streaming | 🔲 Phase B | After batch pipeline stable on AWS |
+| Semantic chunking (optional) | 🔲 Planned | Demand for single-topic academic documents |
+| HNSW index tuning | 🔲 Phase B | RAGAS context recall < 0.80 at 10M documents |
+| CloudWatch logging | 🔲 Phase B | First thing before going live on AWS |
+| Nova Pro model benchmark | 🔲 Phase B | After RAGAS scoring works end-to-end |
+| OKF (Google Open Knowledge Format) | 🔲 Planned | After RAGAS shows gaps on known financial facts |
+| Redis → SQS | 🔲 Phase B | AWS migration |
+| PostgreSQL Docker → RDS | 🔲 Phase B | AWS migration |
+| Celery workers → ECS Fargate | 🔲 Phase B | AWS migration |
+| Qdrant Docker → Qdrant Cloud | 🔲 Phase B | AWS migration |
+| Local files → S3 | 🔲 Phase B | AWS migration |
+| FastAPI local → ECS + ALB | 🔲 Phase B | AWS migration |
+| Batch pipeline → Kinesis streaming | 🔲 Phase B | After batch pipeline stable on AWS |
 
 ---
 
@@ -574,6 +770,27 @@ Implement after batch pipeline is stable on AWS.
 
 ---
 
+### Step 8 — Move Phoenix tracing off local SQLite onto RDS
+**What:** Phoenix (`agents/tracing.py`, added for local trace visibility into the
+query + ingestion pipelines) defaults to a SQLite file on a Docker volume. That
+breaks on ECS Fargate specifically — Fargate tasks have no persistent local disk
+across restarts or scaling, so the SQLite file is wiped on every redeploy. This
+is the one Phoenix change that isn't optional before going to AWS.
+
+**Code change:** Zero. Same container image, two env vars:
+```
+PHOENIX_SQL_DATABASE_URL=postgresql://user:pass@rds-endpoint:5432/phoenix
+PHOENIX_COLLECTOR_ENDPOINT=http://phoenix.internal:4317   # on every app/worker task
+```
+`phoenix` is just a second database on the same RDS instance from Step 2 — no new
+server, no S3/MinIO (that's a Langfuse requirement, not Phoenix's).
+
+**ECS setup:** Deploy Phoenix itself as its own ECS service (same image as local),
+behind an internal ALB or service discovery DNS so app + worker tasks can reach
+port 4317. Do not expose port 6006 (the UI) publicly without auth in front of it.
+
+---
+
 ### Phase B — Migration Order (Do Not Skip Steps)
 
 ```
@@ -584,7 +801,8 @@ Implement after batch pipeline is stable on AWS.
 5. Qdrant Cloud fifth → re-ingest all documents with dense + sparse vectors
 6. ECS API sixth      → connect to Qdrant + RDS, expose via ALB
 7. CloudWatch seventh → verify all logs flowing before going live
-8. Kinesis last       → only after batch pipeline proven stable
+8. Phoenix eighth      → point at RDS before first ECS deploy (SQLite doesn't survive Fargate restarts)
+9. Kinesis last        → only after batch pipeline proven stable
 ```
 
 **The golden rule:** Each step is just changing env vars in the ECS task

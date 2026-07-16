@@ -1,5 +1,5 @@
 """
-db/schema.py — Phase 3 PostgreSQL schema: tenant registry + mock transactions.
+db/schema.py — PostgreSQL schema: tenant registry, transactions, feedback, retrieval params.
 
 Run once before starting the API:
     python -m db.schema
@@ -51,16 +51,28 @@ CREATE INDEX IF NOT EXISTS idx_query_audit_tenant_created
     ON query_audit_log (tenant_id, created_at DESC);
 
 -- Users: one row per login. tenant_id links them to their company's data.
+-- password_hash is NULL for auth_provider='sso' — the company's own identity
+-- provider verifies the password, we never see or store one for those users.
 CREATE TABLE IF NOT EXISTS users (
     user_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     username      TEXT         UNIQUE NOT NULL,
     email         TEXT         UNIQUE NOT NULL,
-    password_hash TEXT         NOT NULL,
+    password_hash TEXT,
+    auth_provider TEXT         NOT NULL DEFAULT 'local' CHECK (auth_provider IN ('local', 'sso')),
     tenant_id     TEXT         NOT NULL,
     customer_id   TEXT         NOT NULL,
-    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT password_required_for_local CHECK (auth_provider = 'sso' OR password_hash IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users (tenant_id);
+
+-- Migration for pre-existing databases: add SSO support to a users table that
+-- was created before auth_provider existed. ponytail: no CHECK-constraint
+-- retrofit on existing tables (Postgres has no ADD CONSTRAINT IF NOT EXISTS) —
+-- the invariant is enforced at the application layer (api/auth.py, api/sso.py)
+-- for rows created after this migration; fresh installs get the CHECK above.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
 
 -- Mock financial transactions for hybrid RAG demo.
 -- In production: replaced by a Kafka → PostgreSQL real-time pipeline.
@@ -109,6 +121,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_seed_unique
         tenant_id, customer_id, amount, merchant, category, date, type,
         COALESCE(description, ''), flagged
     );
+
+-- User feedback on RAG answers. Links back to query_audit_log for full context.
+CREATE TABLE IF NOT EXISTS query_feedback (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_id    UUID         NOT NULL REFERENCES query_audit_log(id) ON DELETE CASCADE,
+    tenant_id   TEXT         NOT NULL,
+    helpful     BOOLEAN      NOT NULL,
+    comment     TEXT,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant_created
+    ON query_feedback (tenant_id, created_at DESC);
+
+-- Chunks delivered to the synthesizer per query. Soft link via query_id (no FK
+-- to avoid slowing down retrieval with a constraint check on every insert).
+-- Used to build reranker training data: cited=true chunks are positives, false are negatives.
+CREATE TABLE IF NOT EXISTS query_chunks (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_id    UUID         NOT NULL,
+    tenant_id   TEXT         NOT NULL,
+    chunk_text  TEXT         NOT NULL,
+    source      TEXT         NOT NULL,
+    score       NUMERIC(6,4),
+    cited       BOOLEAN      NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_query_chunks_query_id ON query_chunks (query_id);
+CREATE INDEX IF NOT EXISTS idx_query_chunks_tenant   ON query_chunks (tenant_id, created_at DESC);
+
+-- Per-tenant tuned retrieval parameters. Updated automatically by feedback tuner.
+-- Falls back to hardcoded defaults in retriever.py if no row exists for a tenant.
+CREATE TABLE IF NOT EXISTS retrieval_params (
+    tenant_id        TEXT         PRIMARY KEY,
+    top_k            INTEGER      NOT NULL DEFAULT 20,
+    rerank_top_n     INTEGER      NOT NULL DEFAULT 8,
+    mmr_final_k      INTEGER      NOT NULL DEFAULT 6,
+    feedback_count   INTEGER      NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
 """
 
 # ── Seed data ─────────────────────────────────────────────────────────────────

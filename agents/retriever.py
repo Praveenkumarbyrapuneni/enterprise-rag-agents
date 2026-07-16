@@ -51,6 +51,7 @@ logger = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Default retrieval params — overridden per-tenant by feedback tuner via retrieval_params table
 _QDRANT_TOP_K   = 20     # candidates per query vector → reranker
 _RERANK_TOP_N   = 8      # reranker output → MMR input
 _MMR_FINAL_K    = 6      # chunks delivered to synthesizer
@@ -413,6 +414,43 @@ def _to_chunks(candidates: list[dict], parent_texts: dict[str, str]) -> list[Ret
     return chunks
 
 
+# ── Chunk logging for fine-tuning data ───────────────────────────────────────
+
+
+def _log_chunks(query_id: str, tenant_id: str, chunks: list) -> None:
+    """
+    Write retrieved chunks to query_chunks table for future fine-tuning export.
+    cited=False at write time; synthesizer updates cited=True for chunks it uses.
+    Non-fatal — a log failure must never block the retrieval response.
+    """
+    if not query_id:
+        return
+    try:
+        import psycopg2
+        url = os.getenv("DATABASE_URL")
+        if not url:
+            return
+        rows = [
+            (query_id, tenant_id, c["text"], c["source"], float(c["score"]))
+            for c in chunks
+        ]
+        conn = psycopg2.connect(url, connect_timeout=3)
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO query_chunks (query_id, tenant_id, chunk_text, source, score)
+                    VALUES (%s::uuid, %s, %s, %s, %s)
+                    """,
+                    rows,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[retriever] _log_chunks failed (non-fatal): {type(e).__name__}: {e}")
+
+
 # ── LangGraph node ────────────────────────────────────────────────────────────
 
 
@@ -435,6 +473,13 @@ def retrieve(state: RAGState) -> RAGState:
     # Build tenant filter — applied to EVERY Qdrant search in this call
     tenant_filter = _build_tenant_filter(tenant_id)
 
+    # Load tuned params for this tenant (falls back to module-level defaults)
+    from .feedback import get_retrieval_params
+    params       = get_retrieval_params(tenant_id)
+    top_k        = params["top_k"]
+    rerank_top_n = params["rerank_top_n"]
+    mmr_final_k  = params["mmr_final_k"]
+
     try:
         # ── Build dense + sparse vectors for all query texts ──────────────────
         dense_vecs: list[list[float]] = [_embed_query(question)]
@@ -453,14 +498,14 @@ def retrieve(state: RAGState) -> RAGState:
 
         # ── Single hybrid search call: all query vectors fused via RRF ───────
         # Qdrant's RRF naturally deduplicates — no manual seen_ids needed.
-        candidates = _search_qdrant(dense_vecs, sparse_vecs, _QDRANT_TOP_K, tenant_filter)
+        candidates = _search_qdrant(dense_vecs, sparse_vecs, top_k, tenant_filter)
 
         if not candidates:
             return {**state, "chunks": [], "error": "retrieve: no results found in Qdrant"}
 
         # ── Rerank → MMR → Parent expansion ───────────────────────────────────
-        reranked = _rerank(question, candidates, _RERANK_TOP_N)
-        diverse  = _mmr(reranked, _MMR_FINAL_K)
+        reranked = _rerank(question, candidates, rerank_top_n)
+        diverse  = _mmr(reranked, mmr_final_k)
 
         parent_ids = [
             c["payload"].get("parent_id")
@@ -474,6 +519,10 @@ def retrieve(state: RAGState) -> RAGState:
             f"[retriever] done — {len(chunks)} chunks "
             f"(searched {len(candidates)}, reranked {len(reranked)}, MMR {len(diverse)})"
         )
+
+        # Log chunks for fine-tuning data export (non-fatal)
+        _log_chunks(state.get("query_id", ""), tenant_id, chunks)
+
         return {**state, "chunks": chunks, "error": None}
 
     except RuntimeError as e:

@@ -223,6 +223,48 @@ def _validate_answer(answer: str) -> None:
         )
 
 
+# ── Step 6: Mark cited chunks for reranker training data ─────────────────────
+
+
+def _cited_filenames(sources: list[str]) -> list[str]:
+    """
+    Reduce citation strings to just the filename, matching query_chunks.source.
+    "Apple.htm, page 14, Chunk #1" -> "Apple.htm"
+    """
+    return list(dict.fromkeys(s.split(",", 1)[0].strip() for s in sources if s.strip()))
+
+
+def _mark_cited(query_id: str, tenant_id: str, sources: list[str]) -> None:
+    """
+    Flag query_chunks rows actually cited in the answer — cited=True chunks
+    become positive examples in the reranker training export.
+    Non-fatal — a DB failure must never affect the response already returned.
+    """
+    filenames = _cited_filenames(sources)
+    if not query_id or not filenames:
+        return
+    try:
+        import psycopg2
+        url = os.getenv("DATABASE_URL")
+        if not url:
+            return
+        conn = psycopg2.connect(url, connect_timeout=3)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE query_chunks SET cited = true
+                    WHERE query_id = %s::uuid AND tenant_id = %s AND source = ANY(%s)
+                    """,
+                    (query_id, tenant_id, filenames),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[synthesizer] _mark_cited failed (non-fatal): {type(e).__name__}: {e}")
+
+
 # ── LangGraph node ────────────────────────────────────────────────────────────
 
 
@@ -304,6 +346,7 @@ def synthesize(state: RAGState) -> RAGState:
             if "Live transaction database" not in sources:
                 sources = ["Live transaction database"] + sources
             _validate_answer(answer)
+            _mark_cited(state.get("query_id", ""), state.get("tenant_id", ""), sources)
             logger.info(f"[synthesizer] hybrid path — {len(answer)} chars, {len(sources)} sources")
             return {**state, "answer": answer, "sources": sources, "error": None}
 
@@ -339,6 +382,7 @@ def synthesize(state: RAGState) -> RAGState:
         answer  = _call_sonnet(question, ordered)
         sources = _extract_sources(answer)
         _validate_answer(answer)
+        _mark_cited(state.get("query_id", ""), state.get("tenant_id", ""), sources)
 
         logger.info(
             f"[synthesizer] rag path — {len(answer)} chars "
@@ -424,4 +468,16 @@ if __name__ == "__main__":
     assert "f1.pdf" in prompt
     assert "test question" in prompt
 
-    print("synthesizer.py self-check passed — reorder, citations, empty-context, prompt format all correct")
+    # 8. Cited filename extraction — strips citation detail down to source filename
+    filenames = _cited_filenames([
+        "Apple.htm, page 14, Chunk #1",
+        "Goldman.htm, page 7, Chunk #3",
+        "Apple.htm, page 14, Chunk #1",  # duplicate, must be dropped
+    ])
+    assert filenames == ["Apple.htm", "Goldman.htm"]
+
+    # 9. _mark_cited is a safe no-op with no query_id or no sources — no DB call attempted
+    _mark_cited("", "apple", ["Apple.htm, page 14, Chunk #1"])   # no query_id
+    _mark_cited("11111111-1111-1111-1111-111111111111", "apple", [])  # no sources
+
+    print("synthesizer.py self-check passed — reorder, citations, empty-context, prompt format, cited-marking all correct")

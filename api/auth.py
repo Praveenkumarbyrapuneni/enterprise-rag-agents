@@ -13,7 +13,8 @@ Security invariants enforced here:
   - Constant-time password check regardless of whether username exists (timing-safe)
   - JWT fields validated on decode — missing fields raise 401, not 500
 
-Phase B: swap _secret() to AWS Secrets Manager; replace bcrypt with Cognito User Pools.
+Company SSO (no password, no bcrypt) is a separate path — see api/sso.py.
+Phase B: swap _secret() to AWS Secrets Manager.
 """
 
 import os
