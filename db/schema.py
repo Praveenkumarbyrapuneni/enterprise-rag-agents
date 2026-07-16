@@ -86,6 +86,29 @@ CREATE INDEX IF NOT EXISTS idx_transactions_date
 -- Partial index for flagged-only queries (most rows are unflagged — avoid full scan)
 CREATE INDEX IF NOT EXISTS idx_transactions_flagged
     ON transactions (tenant_id, customer_id) WHERE flagged = true;
+
+-- Seed idempotency: older versions had no natural uniqueness, so re-running
+-- this script inserted duplicate mock transactions. Keep one copy of each
+-- seeded transaction, then enforce a unique index so ON CONFLICT DO NOTHING
+-- actually works on future runs.
+DELETE FROM transactions a
+USING transactions b
+WHERE a.ctid < b.ctid
+  AND a.tenant_id = b.tenant_id
+  AND a.customer_id = b.customer_id
+  AND a.amount = b.amount
+  AND a.merchant = b.merchant
+  AND a.category = b.category
+  AND a.date = b.date
+  AND a.type = b.type
+  AND COALESCE(a.description, '') = COALESCE(b.description, '')
+  AND a.flagged = b.flagged;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_seed_unique
+    ON transactions (
+        tenant_id, customer_id, amount, merchant, category, date, type,
+        COALESCE(description, ''), flagged
+    );
 """
 
 # ── Seed data ─────────────────────────────────────────────────────────────────

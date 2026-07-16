@@ -7,7 +7,7 @@ Usage:
 
 Requires:
     - Docker running: docker compose up -d
-    - .env file with ANTHROPIC_API_KEY and OPENAI_API_KEY
+    - .env file with AWS Bedrock credentials, DATABASE_URL, and QDRANT settings
 """
 
 import argparse
@@ -28,7 +28,7 @@ def _hash_file(path: str) -> str:
     return h.hexdigest()
 
 
-def run(file_path: str, query_text: str) -> None:
+def run(file_path: str, query_text: str, tenant_id: str = "demo") -> None:
     from ingestion.chunker import chunk_document
     from ingestion.embedder import build_document_text, embed_chunks
     from ingestion.parser import parse_document
@@ -61,7 +61,7 @@ def run(file_path: str, query_text: str) -> None:
         print(f"  Preview chunk 0: {chunks[0]['text'][:200]}...")
 
     # ── Step 3: Embed ─────────────────────────────────────────────
-    print(f"\n{sep}\nSTEP 3 — Embed  (text-embedding-3-large, 3072 dims)\n{sep}")
+    print(f"\n{sep}\nSTEP 3 — Embed  (Cohere Embed v3 via Bedrock, 1024 dims)\n{sep}")
     document_text = build_document_text(pages)
     embedded = embed_chunks(chunks, document_text, file_name)
     print(f"  {len(embedded)} vectors, {len(embedded[0]['vector'])} dims each")
@@ -69,7 +69,7 @@ def run(file_path: str, query_text: str) -> None:
     # ── Step 4: Upload ────────────────────────────────────────────
     print(f"\n{sep}\nSTEP 4 — Upload to Qdrant + PostgreSQL\n{sep}")
     bootstrap_schema()
-    upload_result = upload_document(embedded, parents, file_name, file_hash)
+    upload_result = upload_document(embedded, parents, file_name, file_hash, tenant_id=tenant_id)
     if upload_result["skipped"]:
         print("  Document already indexed — skipped (idempotent)")
     else:
@@ -80,9 +80,9 @@ def run(file_path: str, query_text: str) -> None:
 
     # ── Step 5: Query ─────────────────────────────────────────────
     print(f"\n{sep}\nSTEP 5 — Query: '{query_text}'\n{sep}")
-    from ingestion.embedder import _embed_batch_with_retry, _truncate_to_tokens
+    from agents.retriever import _embed_query
 
-    query_vector = _embed_batch_with_retry([query_text], file_name)[0]
+    query_vector = _embed_query(query_text)
     results = query_similar(query_vector, top_k=3, file_name_filter=file_name)
 
     for i, r in enumerate(results, 1):
@@ -98,10 +98,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Enterprise RAG pipeline demo")
     parser.add_argument("--file",  required=True, help="Path to document")
     parser.add_argument("--query", required=True, help="Question to answer")
+    parser.add_argument("--tenant-id", default="demo", help="Tenant ID to attach to uploaded chunks")
     args = parser.parse_args()
 
     if not os.path.exists(args.file):
         print(f"Error: file not found: {args.file}")
         sys.exit(1)
 
-    run(args.file, args.query)
+    run(args.file, args.query, tenant_id=args.tenant_id)

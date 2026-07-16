@@ -8,6 +8,7 @@ venv/
 dist/
 build/
 *.log
+logs/
 data/
 
 # local-only files — never push

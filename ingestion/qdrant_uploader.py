@@ -32,7 +32,7 @@ Environment variables:
   DATABASE_URL            — PostgreSQL DSN (required)
   QDRANT_HOST             — default: localhost
   QDRANT_PORT             — default: 6333
-  QDRANT_COLLECTION_NAME  — default: chunks
+  QDRANT_COLLECTION_NAME  — default: documents
   QDRANT_BATCH_SIZE       — default: 256
 """
 
@@ -77,7 +77,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "chunks")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "documents")
 VECTOR_SIZE     = 1024                                    # cohere.embed-english-v3 (AWS Bedrock)
 BATCH_SIZE      = int(os.getenv("QDRANT_BATCH_SIZE", "256"))
 _MAX_RETRIES    = 5
@@ -138,17 +138,24 @@ CREATE TABLE IF NOT EXISTS parent_chunks (
     parent_id   UUID         PRIMARY KEY,
     file_hash   VARCHAR(64)  NOT NULL,
     file_name   TEXT         NOT NULL,
+    tenant_id   TEXT         NOT NULL DEFAULT '',
     text        TEXT         NOT NULL,
     page        INT,
     metadata    JSONB        NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+ALTER TABLE parent_chunks
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_ingestion_status_status
     ON ingestion_status (status);
 
 CREATE INDEX IF NOT EXISTS idx_parent_chunks_file_hash
     ON parent_chunks (file_hash);
+
+CREATE INDEX IF NOT EXISTS idx_parent_chunks_tenant_id
+    ON parent_chunks (tenant_id);
 """
 
 

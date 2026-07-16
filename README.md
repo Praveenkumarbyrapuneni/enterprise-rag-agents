@@ -89,7 +89,7 @@ Query Analyzer (Claude Haiku) classifies: sql / rag / hybrid
       ↓
   sql    → PostgreSQL transaction lookup (exact data, no LLM synthesis)
   rag    → Qdrant hybrid search (dense + BM25, RRF fusion, tenant-filtered)
-             → Cohere rerank → MMR dedup → parent context expansion
+             → optional external rerank (disabled by default) → MMR dedup → parent context expansion
   hybrid → both paths combined
       ↓
 Synthesizer (Claude Sonnet) writes grounded answer with inline citations
@@ -113,7 +113,7 @@ Answer returned via FastAPI
 | Metadata + transactions | PostgreSQL |
 | Task queue | Celery + Redis |
 | Agent framework | LangGraph (6-node pipeline) |
-| Re-ranking | Cohere Rerank v3 |
+| Re-ranking | Optional external Cohere Rerank v3, disabled by default to keep data inside AWS |
 | API | FastAPI — JWT auth, per-token revocation, sliding-window rate limiting |
 
 All AI calls go through AWS Bedrock. Data never leaves the VPC.

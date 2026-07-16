@@ -33,6 +33,7 @@ Known limitation:
 import base64
 import email as email_lib
 import io
+import json
 import logging
 import os
 import re
@@ -57,12 +58,15 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Vision client singleton — one client, reused across all image extractions.
+# Bedrock Vision client singleton — one client, reused across all image extractions.
 # Avoids creating a new connection pool per image (50 images = 50 pool setups
-# without this). Timeout kills hung Vision calls in 30s instead of 600s default.
+# without this). Timeout kills hung Vision calls in 30s instead of the SDK default.
 _vision_client    = None
 _vision_client_lock = threading.Lock()
 _VISION_TIMEOUT   = 30.0
+_VISION_MODEL     = os.getenv(
+    "BEDROCK_SONNET_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
+)
 
 
 def _get_vision_client():
@@ -70,11 +74,18 @@ def _get_vision_client():
     if _vision_client is None:
         with _vision_client_lock:
             if _vision_client is None:
-                import anthropic
-                key = os.getenv("ANTHROPIC_API_KEY")
-                if not key:
-                    raise ValueError("ANTHROPIC_API_KEY not set — required for image parsing")
-                _vision_client = anthropic.Anthropic(api_key=key, timeout=_VISION_TIMEOUT)
+                import boto3
+                from botocore.config import Config
+
+                _vision_client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                    config=Config(
+                        connect_timeout=5,
+                        read_timeout=_VISION_TIMEOUT,
+                        retries={"max_attempts": 2},
+                    ),
+                )
     return _vision_client
 
 # DOCX namespace constants for chart and text box extraction
@@ -87,20 +98,20 @@ _DOCX_R_ID_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relati
 
 def _extract_image_text(image_bytes: bytes, media_type: str = "image/png") -> str:
     """
-    Send image bytes to Claude Vision, return extracted text.
+    Send image bytes to Claude Vision through Bedrock, return extracted text.
 
     Claude understands layout — tables in images, charts, multi-column text —
     where traditional OCR (Tesseract) fails on complex financial documents.
 
-    Uses the module-level singleton client (_get_vision_client) so that one
+    Uses the module-level Bedrock singleton (_get_vision_client) so that one
     connection pool is reused across all images in a document rather than
-    creating a new one per image. Times out in _VISION_TIMEOUT seconds.
+    creating a new one per image.
     """
     client = _get_vision_client()
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        messages=[{
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1024,
+        "messages": [{
             "role": "user",
             "content": [
                 {
@@ -122,8 +133,15 @@ def _extract_image_text(image_bytes: bytes, media_type: str = "image/png") -> st
                 },
             ],
         }],
+    })
+    response = client.invoke_model(
+        modelId=_VISION_MODEL,
+        body=body,
+        contentType="application/json",
+        accept="application/json",
     )
-    return response.content[0].text
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"]
 
 
 def _rows_to_markdown(rows: List[List[str]]) -> str:

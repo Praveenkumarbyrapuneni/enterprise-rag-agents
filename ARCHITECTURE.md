@@ -74,7 +74,7 @@ at 10M documents or millions of tenants, it is not used.
 ### Path 2 — RAG (document knowledge)
 **Triggers:** filing analysis, risk assessment, regulatory questions, strategy
 **Flow:** Query Analyzer → Retriever → Synthesizer (Claude) → Evaluator → retry?
-**Retriever internals:** dense Prefetch + BM25 sparse Prefetch → RRF fusion → Cohere rerank → MMR → parent expansion
+**Retriever internals:** dense Prefetch + BM25 sparse Prefetch → RRF fusion → optional external rerank (disabled by default) → MMR → parent expansion
 **Evaluator score:** LLM-as-judge on faithfulness + relevance
 
 ### Path 3 — Hybrid (live data + document knowledge)
@@ -166,4 +166,4 @@ All AI calls go through AWS Bedrock. Data never leaves the AWS VPC.
 | Answer synthesis | Claude Sonnet 4 via Bedrock |
 | Query classification, evaluation, enrichment | Claude Haiku 4.5 via Bedrock |
 | Embeddings | Cohere Embed v3 via Bedrock (1024 dims) |
-| Re-ranking | Cohere Rerank v3 (direct API) |
+| Re-ranking | Optional external Cohere Rerank v3, disabled by default to keep data inside AWS |

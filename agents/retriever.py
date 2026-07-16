@@ -8,8 +8,9 @@ Search strategy:
      Dense captures semantic meaning. BM25 captures exact financial terms
      ("SOFR rate 2024-06-30", "Form 10-Q Schedule 14A", specific dollar amounts).
      RRF (Reciprocal Rank Fusion) combines both without parameter tuning.
-  3. Cohere rerank: up to 40 candidates → top _RERANK_TOP_N=8.
-     Times out after _COHERE_TIMEOUT seconds; falls back to raw RRF order (non-fatal).
+  3. Optional external Cohere rerank: disabled by default so document data stays
+     inside AWS. Set ALLOW_EXTERNAL_RERANK=true + COHERE_API_KEY only if your
+     deployment explicitly permits sending candidate text to Cohere.
   4. MMR: remove near-duplicate chunks while preserving relevance.
      Uses stored dense vectors — no extra API calls.
   5. Parent context expansion: chunks with a parent_id get swapped for their
@@ -19,9 +20,9 @@ Production failure handling:
   - Empty question          → set error, return immediately
   - Qdrant timeout          → retry 3x with exponential backoff; set error on exhaustion
   - Zero results            → set error, return cleanly
-  - Cohere rerank failure   → log warning, return raw RRF order (non-fatal)
+  - Rerank disabled/failure → return raw RRF order (non-fatal)
   - PostgreSQL parent fetch  → log warning, return child text only (non-fatal)
-  - Missing COHERE_API_KEY  → skip reranking, log warning
+  - Missing COHERE_API_KEY  → skip opt-in external reranking, log warning
 """
 
 import concurrent.futures
@@ -231,12 +232,17 @@ def _search_qdrant(
     ) from last_exc
 
 
-# ── Step 3: Cohere reranking ──────────────────────────────────────────────────
+# ── Step 3: Optional external reranking ───────────────────────────────────────
 
 
 def _rerank(question: str, candidates: list[dict], top_n: int) -> list[dict]:
     """
-    Re-score candidates with Cohere rerank. Non-fatal: returns raw top-k on any failure.
+    Optionally re-score candidates with Cohere rerank.
+
+    Disabled by default: this project promises that financial document data stays
+    in AWS. Direct Cohere rerank sends candidate text to Cohere, so it only runs
+    when ALLOW_EXTERNAL_RERANK=true is set deliberately. Non-fatal: returns raw
+    top-k on any failure or when disabled.
 
     Score gotcha: Cohere scores are ordinal, not arithmetic.
     0.91 is not twice as relevant as 0.45 — use them for ranking only.
@@ -246,9 +252,19 @@ def _rerank(question: str, candidates: list[dict], top_n: int) -> list[dict]:
     if not candidates:
         return candidates
 
+    allow_external = os.getenv("ALLOW_EXTERNAL_RERANK", "false").lower() in {
+        "1", "true", "yes"
+    }
+    if not allow_external:
+        logger.info(
+            "[retriever] external reranking disabled — using raw RRF order "
+            "(set ALLOW_EXTERNAL_RERANK=true to opt in)"
+        )
+        return candidates[:top_n]
+
     api_key = os.getenv("COHERE_API_KEY")
     if not api_key:
-        logger.warning("[retriever] COHERE_API_KEY not set — skipping reranking")
+        logger.warning("[retriever] ALLOW_EXTERNAL_RERANK=true but COHERE_API_KEY is not set")
         return candidates[:top_n]
 
     def _call_cohere() -> list[dict]:

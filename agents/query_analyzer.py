@@ -259,9 +259,33 @@ def _validate(raw: dict, question: str) -> dict:
 
 
 def _fallback(question: str) -> dict:
-    """Safe defaults used when the LLM call or parsing fails."""
+    """
+    Deterministic fallback used when the LLM call or parsing fails.
+
+    This keeps obvious account-data questions on the SQL path during Bedrock
+    throttling instead of misrouting them to document RAG.
+    """
+    q = question.lower()
+    hybrid_signals = (
+        "why was i charged", "why am i charged", "charged a fee",
+        "foreign transaction fee", "fee policy", "complies with policy",
+        "compare my transaction", "why was this charge",
+    )
+    sql_signals = (
+        "balance", "account total", "how much money", "last transaction",
+        "recent transaction", "transactions", "transaction history",
+        "flagged", "suspicious", "unusual", "blocked", "spending",
+        "spent", "category", "merchant",
+    )
+    if any(s in q for s in hybrid_signals):
+        query_type = "hybrid"
+    elif any(s in q for s in sql_signals):
+        query_type = "sql"
+    else:
+        query_type = "general"
+
     return {
-        "query_type":          "general",
+        "query_type":          query_type,
         "needs_decomposition": False,
         "sub_questions":       [],
         "hyde_applicable":     False,

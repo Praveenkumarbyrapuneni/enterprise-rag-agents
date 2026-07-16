@@ -898,29 +898,28 @@ wastes 7 seconds and returns the same error. Raise immediately.
 A 503 means Qdrant is temporarily overloaded. Retry after backoff — it will
 likely recover.
 
-### Cohere Timeout via ThreadPoolExecutor — SDK Has No Timeout Param
+### External Reranking Is Explicit Opt-In
 
-The Cohere reranker SDK does not expose a timeout parameter. If Cohere's API
-hangs, the call blocks indefinitely — freezing the worker.
+Direct Cohere reranking can improve candidate ordering, but it sends retrieved
+candidate text outside AWS. That conflicts with the default privacy posture for
+financial documents.
 
-Fix: run the Cohere call inside a `ThreadPoolExecutor` with a timeout:
+Fix: external reranking is disabled unless both of these are set:
 
-```python
-with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-    future = executor.submit(_call_cohere)
-    return future.result(timeout=_COHERE_TIMEOUT)  # 12 seconds
+```
+ALLOW_EXTERNAL_RERANK=true
+COHERE_API_KEY=...
 ```
 
-If the call doesn't complete in 12 seconds, `TimeoutError` is raised and the
-system falls back to raw vector order (reranking skipped). The query still
-completes — it just returns slightly lower-quality results.
+If the flag is absent, retrieval uses raw RRF order and proceeds to MMR. This
+keeps the default system Bedrock-only. If a deployment explicitly opts into
+external reranking, the Cohere SDK call still runs inside a `ThreadPoolExecutor`
+with a 12-second timeout so a hung external API call cannot freeze the worker.
 
-Cohere's p50 latency is 100-400ms. A 12-second timeout catches genuine hangs
-while never triggering on normal slow responses.
+### BM25 Hybrid Search + Optional External Reranker
 
-### BM25 Hybrid Search + Cohere Reranker — Both Active
-
-The retrieval pipeline runs two complementary techniques in sequence:
+The retrieval pipeline runs hybrid search in every query. External reranking is
+available only as an explicit opt-in:
 
 **Step 1 — Hybrid search (BM25 + dense, RRF fusion)**
 
@@ -937,7 +936,7 @@ semantic information. It encodes weak exact-term information. A query for "Basel
 III Tier 1 capital ratio 12.4%" will find conceptually similar chunks but may
 miss the chunk containing that exact string. BM25 finds it directly.
 
-**Step 2 — Cohere Reranker**
+**Step 2 — Optional external Cohere reranker**
 
 After RRF fusion returns up to 40 candidates, Cohere Rerank v3 reads the full
 question and each candidate chunk as a cross-encoder — fundamentally different
@@ -946,11 +945,12 @@ returns the top 8.
 
 Cohere's published benchmarks report 30-48% precision improvement from reranking
 (measured on Cohere's test sets — not independently verified on this corpus).
-It runs inside a ThreadPoolExecutor with a 12-second timeout — if Cohere's API
-hangs, retrieval falls back to raw RRF order (non-fatal).
+It runs only when `ALLOW_EXTERNAL_RERANK=true`. If disabled, missing, or failed,
+retrieval falls back to raw RRF order (non-fatal).
 
-Both techniques are active as of 2026-07-03. The collection was re-ingested with
-named vector fields: `"dense"` (Cohere 1024-dim) + `"sparse"` (BM25 inverted index).
+Hybrid search is active as of 2026-07-03. The collection was re-ingested with
+named vector fields: `"dense"` (Cohere Embed v3 1024-dim via Bedrock) + `"sparse"`
+(BM25 inverted index).
 
 ### MMR: lambda=0.6
 

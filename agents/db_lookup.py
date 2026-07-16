@@ -29,6 +29,7 @@ Failure handling:
 
 import json
 import os
+import re
 from typing import Optional
 
 import boto3
@@ -56,10 +57,10 @@ _TEMPLATES: dict[str, tuple[str, list[str]]] = {
     "balance": (
         """
         SELECT
-            SUM(CASE WHEN type = 'credit' THEN amount ELSE -amount END) AS balance,
+            SUM(amount) AS balance,
             COUNT(*) AS total_transactions,
             SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) AS total_credits,
-            SUM(CASE WHEN type = 'debit'  THEN amount ELSE 0 END) AS total_debits
+            SUM(CASE WHEN type = 'debit'  THEN ABS(amount) ELSE 0 END) AS total_debits
         FROM transactions
         WHERE tenant_id = %s AND customer_id = %s
         """,
@@ -88,7 +89,7 @@ _TEMPLATES: dict[str, tuple[str, list[str]]] = {
     "spending_period": (
         """
         SELECT
-            SUM(amount) AS total_spent,
+            SUM(ABS(amount)) AS total_spent,
             COUNT(*)    AS num_transactions,
             MIN(date)   AS from_date,
             MAX(date)   AS to_date
@@ -103,7 +104,7 @@ _TEMPLATES: dict[str, tuple[str, list[str]]] = {
         """
         SELECT
             category,
-            SUM(amount)  AS total,
+            SUM(ABS(amount))  AS total,
             COUNT(*)     AS count
         FROM transactions
         WHERE tenant_id = %s AND customer_id = %s AND type = 'debit'
@@ -204,6 +205,38 @@ def _safe_intent(raw: dict) -> dict:
     return {"intent": intent, "limit": limit, "days": days, "merchant": merchant}
 
 
+def _fallback_intent(question: str) -> dict:
+    """
+    Deterministic fallback when Haiku intent classification is unavailable.
+    Keeps common account-data questions useful during Bedrock quota throttling.
+    """
+    q = question.lower()
+
+    if any(s in q for s in ("balance", "account total", "how much money")):
+        intent = "balance"
+    elif any(s in q for s in ("flagged", "suspicious", "unusual", "blocked")):
+        intent = "flagged"
+    elif "category" in q or "breakdown" in q:
+        intent = "by_category"
+    elif any(s in q for s in ("spending", "spent", "this month", "this week")):
+        intent = "spending_period"
+    else:
+        intent = "recent"
+
+    limit = _DEFAULT_LIMIT
+    m = re.search(r"\b(?:last|recent)\s+(\d{1,2})\b", q)
+    if m:
+        limit = max(1, min(int(m.group(1)), _ROW_LIMIT))
+
+    days = _DEFAULT_DAYS
+    if "week" in q:
+        days = 7
+    elif "month" in q:
+        days = 30
+
+    return {"intent": intent, "limit": limit, "days": days, "merchant": None}
+
+
 # ── SQL execution ─────────────────────────────────────────────────────────────
 
 
@@ -290,7 +323,7 @@ def _format_result(intent: str, rows: list[dict], params: dict) -> str:
         for r in rows:
             flag_str = " ⚠️ FLAGGED" if r.get("flagged") else ""
             lines.append(
-                f"  {r['date']} | {r['merchant']} | ${float(r['amount']):,.2f} "
+                f"  {r['date']} | {r['merchant']} | ${abs(float(r['amount'])):,.2f} "
                 f"({r['type']}){flag_str}"
             )
         if not rows:
@@ -300,7 +333,7 @@ def _format_result(intent: str, rows: list[dict], params: dict) -> str:
     # recent / by_merchant — tabular
     lines = [f"Transactions ({len(rows)} results):"]
     for r in rows:
-        amount   = float(r.get("amount") or 0)
+        amount   = abs(float(r.get("amount") or 0))
         flag_str = " ⚠️" if r.get("flagged") else ""
         desc     = f" — {r['description']}" if r.get("description") else ""
         lines.append(
@@ -340,10 +373,9 @@ def db_lookup(state: RAGState) -> RAGState:
         except (ClientError, json.JSONDecodeError, KeyError) as e:
             logger.warning(
                 f"[db_lookup] Haiku classification failed ({type(e).__name__}: {e}) "
-                "— falling back to 'recent'"
+                "— using deterministic fallback intent"
             )
-            intent_params = {"intent": _DEFAULT_INTENT, "limit": _DEFAULT_LIMIT,
-                             "days": _DEFAULT_DAYS, "merchant": None}
+            intent_params = _fallback_intent(question)
 
         logger.info(
             f"[db_lookup] intent={intent_params['intent']} "

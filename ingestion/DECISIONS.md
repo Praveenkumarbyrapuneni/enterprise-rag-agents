@@ -195,16 +195,20 @@ _vision_client    = None
 _vision_client_lock = threading.Lock()
 _VISION_TIMEOUT   = 30.0
 
-_vision_client = anthropic.Anthropic(api_key=key, timeout=_VISION_TIMEOUT)
+_vision_client = boto3.client(
+    "bedrock-runtime",
+    region_name=os.getenv("AWS_REGION", "us-east-1"),
+    config=Config(connect_timeout=5, read_timeout=_VISION_TIMEOUT),
+)
 ```
 
-A financial PDF with 50 embedded images would create 50 separate Anthropic client
-instances without the singleton — 50 connection pool setups in rapid succession.
+A financial PDF with 50 embedded images would create 50 separate Bedrock clients
+without the singleton — 50 connection pool setups in rapid succession.
 The double-checked locking pattern ensures one client is created regardless of
 concurrent calls.
 
 The 30-second timeout kills hung Vision calls. Without it, a single unresponsive
-Vision API call blocks the entire parser for up to 600 seconds (the library default),
+Bedrock Vision call blocks the entire parser for too long,
 holding a Celery worker slot that should be processing other documents.
 
 ### N-Column PDF Layout Detection
