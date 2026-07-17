@@ -7,7 +7,9 @@ Run once before starting the API:
 Safe to re-run: all creates use IF NOT EXISTS, inserts use ON CONFLICT DO NOTHING.
 """
 
+import hashlib
 import os
+import secrets
 import sys
 
 import psycopg2
@@ -27,6 +29,12 @@ CREATE TABLE IF NOT EXISTS tenant_registry (
 );
 CREATE INDEX IF NOT EXISTS idx_tenant_registry_tenant_id
     ON tenant_registry (tenant_id);
+
+-- SHA-256 hash of the tenant's server-to-server secret, used to authenticate
+-- their backend (never the customer's browser) when calling
+-- POST /internal/mint-customer-token. NULL = tenant not yet provisioned for
+-- this integration. See db.schema.provision_service_key().
+ALTER TABLE tenant_registry ADD COLUMN IF NOT EXISTS service_key_hash TEXT;
 
 -- Immutable query audit log — required for SEC/FINRA compliance.
 -- Every AI response must log: what was asked, what data was used, what was returned.
@@ -252,6 +260,42 @@ def setup_phase3_schema() -> None:
         conn.close()
 
 
+def provision_service_key(tenant_id: str) -> str:
+    """
+    Generate a new server-to-server secret for a tenant's backend to call
+    POST /internal/mint-customer-token on behalf of its already-authenticated
+    customers. Only the SHA-256 hash is stored — the raw key is returned
+    exactly once and must be handed to the tenant out-of-band (never logged,
+    never stored in our own DB in plaintext).
+
+    Re-running this immediately invalidates the tenant's previous key.
+    """
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL not set")
+
+    raw_key  = secrets.token_hex(32)
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    conn = psycopg2.connect(url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tenant_registry SET service_key_hash = %s WHERE tenant_id = %s",
+                (key_hash, tenant_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"No tenant_registry row for tenant_id={tenant_id!r}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return raw_key
+
+
 def get_tenant_id(email: str) -> str | None:
     """
     Look up tenant_id for a given email address by matching the domain.
@@ -286,4 +330,10 @@ def get_tenant_id(email: str) -> str | None:
 
 
 if __name__ == "__main__":
-    setup_phase3_schema()
+    # python -m db.schema --provision-key goldman
+    if len(sys.argv) == 3 and sys.argv[1] == "--provision-key":
+        key = provision_service_key(sys.argv[2])
+        print(f"Service key for tenant '{sys.argv[2]}' — save this now, it will not be shown again:")
+        print(key)
+    else:
+        setup_phase3_schema()

@@ -140,13 +140,13 @@ def _verify_password(plain: str, hashed: str) -> bool:
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
-def _make_token(user_id: str, tenant_id: str, customer_id: str) -> str:
+def _make_token(user_id: str, tenant_id: str, customer_id: str, ttl_hours: float | None = None) -> str:
     payload = {
         "sub":         user_id,
         "tenant_id":   tenant_id,
         "customer_id": customer_id,
         "jti":         str(uuid.uuid4()),   # unique token ID — enables revocation on logout
-        "exp":         datetime.now(timezone.utc) + timedelta(hours=_TTL),
+        "exp":         datetime.now(timezone.utc) + timedelta(hours=ttl_hours if ttl_hours is not None else _TTL),
     }
     return jwt.encode(payload, _secret(), algorithm=_ALG)
 

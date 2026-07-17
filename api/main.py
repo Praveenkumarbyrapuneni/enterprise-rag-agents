@@ -2,8 +2,12 @@
 api/main.py — FastAPI gateway for the Enterprise RAG system.
 
 Endpoints:
-  POST /auth/register — create a user account under a tenant
-  POST /auth/login    — returns a signed JWT
+  POST /auth/register              — create a user account under a tenant
+  POST /auth/login                 — returns a signed JWT
+  POST /internal/mint-customer-token — server-to-server: exchange a tenant's
+                                        service key + a customer_id it already
+                                        trusts (its own app login) for a JWT.
+                                        See api/service_auth.py.
   POST /query         — main query endpoint (JWT-authenticated, rate-limited)
   POST /feedback      — submit helpful/not-helpful feedback on a query response
   GET  /health        — liveness check (no auth, for load balancer)
@@ -45,6 +49,7 @@ from agents.logger import get_logger
 from api.auth import decode_token, router as auth_router
 from api.feedback_router import router as feedback_router
 from api.rate_limit import check_rate_limit, RATE_LIMIT
+from api.service_auth import router as service_auth_router
 from api.sso import router as sso_router
 
 logger = get_logger(__name__)
@@ -82,6 +87,7 @@ if _session_secret:
 app.include_router(auth_router)
 app.include_router(sso_router)
 app.include_router(feedback_router)
+app.include_router(service_auth_router)
 
 
 # ── Fork-safe startup hook ────────────────────────────────────────────────────
