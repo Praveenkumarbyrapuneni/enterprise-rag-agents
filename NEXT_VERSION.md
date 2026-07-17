@@ -10,6 +10,8 @@ has a clear reason it was parked and a clear signal for when to pick it up.
 
 | Feature | Completed | Notes |
 |---|---|---|
+| Server-to-server customer-token minting | 2026-07-16 | `api/service_auth.py` — `POST /internal/mint-customer-token`. Lets an already-authenticated app's own backend (never the customer's browser) exchange a pre-shared, hashed service key + a trusted `customer_id` for a short-lived (1h) JWT scoped to that customer — same OAuth 2.0 Token Exchange shape (RFC 8693). Reuses `_make_token`/`decode_token`/`/query` unchanged. Verified live: correct-key mint → real `/query` returned the right customer's own data; wrong key → 401; unprovisioned tenant → identical generic 401 (no enumeration signal); cross-tenant — one tenant's key against another tenant's `customer_id` → rejected. Regression-checked the untouched password login path (register→login→query→logout) still works identically. `db/schema.py` added `tenant_registry.service_key_hash` (SHA-256 only) + `provision_service_key()` CLI. Pushed `03e7ac5`. |
+| JWT_SECRET_KEY rotation (2026-07-14 leak) | 2026-07-15 | Compromised key (partial leak via a malformed `.env` line) rotated in both `.env` files; every old assignment removed regardless of position/order; `.env.bak*` added to `.gitignore`. See `learnings/env_secret_rotation_learnings.md`. |
 | Local tracing/observability (Phoenix) | 2026-07-14 | `agents/tracing.py` — self-hosted OTel via Docker, auto-traces every LangGraph node + Bedrock call, manual spans on the 4 ingestion steps. Verified live: toy graph proved per-node spans (including non-LLM nodes), real Apple doc ingestion proved end-to-end. See Step 8 in Phase B checklist below for the AWS migration note (SQLite → RDS). |
 | Company SSO login (OIDC) | 2026-07-14 | `api/sso.py` — employees log in with their existing company account (Okta/Azure AD/Google Workspace/any OIDC provider) instead of a new username+password. Config-only to swap providers (`OIDC_ISSUER_URL`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI`/`SESSION_SECRET_KEY`). Issues the same JWT shape as password login — zero downstream changes. Old password-based `/auth/register`+`/auth/login` kept alongside for local testing without a real IdP; a real deployment just wouldn't expose those two endpoints. `db/schema.py` migrated: `users.password_hash` now nullable, new `auth_provider` column ('local'\|'sso'). **Not yet live-tested against a real identity provider** — verified via app boot + clean 503 when unconfigured; needs one manual step (register an OAuth client, e.g. free Google OAuth Client ID — your `gmail.com` already maps to the seeded `demo` tenant) to prove an actual login round-trip. |
 | cited=True chunk marking | 2026-07-14 | `agents/synthesizer.py::_mark_cited` — UPDATE query_chunks after every rag/hybrid answer |
@@ -22,28 +24,6 @@ has a clear reason it was parked and a clear signal for when to pick it up.
 ---
 
 ## 🔲 What's Next (build in this order)
-
-### 0. Rotate JWT_SECRET_KEY ← do this FIRST, before anything else
-
-**What:** On 2026-07-14, a malformed `.env` (a missing newline merged the
-`EMBEDDER_CONTEXT_MODE` and `JWT_SECRET_KEY` lines into one) caused part of
-the real `JWT_SECRET_KEY` value to print into a terminal session. That value
-must be treated as compromised — anyone holding it can forge a valid login
-token for any tenant, no password needed (see `api/auth.py::_make_token`).
-
-**How:**
-1. `openssl rand -hex 32` → new value
-2. Update `JWT_SECRET_KEY` in **both** `.env` files:
-   `~/Clients/personal/enterprise-rag-agents/.env` and
-   `~/Desktop/Vsoln/enterprise-rag-agents/.env`
-3. While in there, check the surrounding lines for other merged/garbled
-   values — the same formatting bug may have corrupted more than one line.
-4. Restart the API so any existing tokens signed with the old secret stop working.
-
-**Effort:** ~5 minutes. Not optional — do this before touching anything else,
-including the PII guardrails work below.
-
----
 
 ### 1. Guardrails — PII detection + output validation
 
@@ -156,6 +136,35 @@ Get those right first — then GraphRAG makes the product substantially stronger
 **Effort:** 1-2 weeks. Entity extraction (Claude Haiku), graph storage (Neo4j or NetworkX),
 graph traversal node added to LangGraph pipeline, query router updated to detect
 multi-hop questions.
+
+---
+
+### 5. Transaction stream consumer
+
+**What:** `transactions` is currently seeded once by `db/schema.py`. Real deployments need
+new transactions landing continuously. Add a consumer that reads a transaction stream
+(Kafka locally / Kinesis on AWS — no code change between phases, same pattern as every
+other component in this repo) and upserts into PostgreSQL as events arrive.
+
+**Why now:** No dependency on guardrails/streaming/demo-mode above — can be built in
+parallel whenever picked up. Unblocks testing against continuously-arriving data instead
+of a static seed.
+
+**Effort:** ~1 day for a Celery task that consumes and upserts idempotently (same
+idempotency-key discipline as the rest of the ingestion pipeline).
+
+---
+
+### 6. S3 document auto-ingest — deprioritized for Phase A
+
+**What:** Replace the hardcoded `TENANT_MAP` in `scripts/reingest_with_tenants.py` with
+a watcher on an S3 prefix per tenant, so new documents ingest automatically instead of
+via a manual script run.
+
+**Why parked:** Phase A is laptop/Docker — there is no real S3 bucket to point at yet.
+Building the watcher against nothing is speculative work. This is a Phase B config swap
+(local folder watch → S3 event notification), not new logic, so there's no cost to
+deferring it. Revisit once a real bucket exists.
 
 ---
 
